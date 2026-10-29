@@ -21,6 +21,19 @@ function nextId(prefix = "rec") {
   return `${prefix}_${Date.now().toString(36)}${idCounter.toString(36)}`;
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export function isUuid(v) { return typeof v === "string" && UUID_RE.test(v); }
+export function newUuid() {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  const b = new Uint8Array(16);
+  if (globalThis.crypto?.getRandomValues) globalThis.crypto.getRandomValues(b);
+  else for (let i = 0; i < 16; i++) b[i] = Math.floor(Math.random() * 256);
+  b[6] = (b[6] & 0x0f) | 0x40;
+  b[8] = (b[8] & 0x3f) | 0x80;
+  const h = [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+
 // ------------------------------------------------------------ local store
 // Pure state logic over a {getItem,setItem} storage — unit-testable in node
 // with an in-memory shim, and used by LocalAdapter with real localStorage.
@@ -126,9 +139,12 @@ export class SupabaseAdapter {
     this.mode = "supabase";
     this.url = config.supabaseUrl.replace(/\/$/, "");
     this.key = config.supabaseAnonKey;
-    this.userId = globalThis.localStorage?.getItem("liveos.userId") || (() => {
-      const id = nextId("user"); globalThis.localStorage?.setItem("liveos.userId", id); return id;
-    })();
+    // module_installs.user_id is a uuid column: the per-browser id MUST be a
+    // real UUID or the installs query in getState() fails (22P02) and the
+    // shell never renders. A legacy non-UUID stored id is replaced.
+    const storedId = globalThis.localStorage?.getItem("liveos.userId");
+    this.userId = isUuid(storedId) ? storedId : newUuid();
+    if (this.userId !== storedId) globalThis.localStorage?.setItem("liveos.userId", this.userId);
     this._hash = "";
     this._timer = null;
     this._ws = null;

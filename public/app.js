@@ -119,9 +119,17 @@ function render() {
 }
 
 async function refresh(reason) {
-  state = await adapter.getState();
-  render();
-  if (reason) console.debug("[liveos] re-render:", reason);
+  try {
+    state = await adapter.getState();
+    render();
+    if (reason) console.debug("[liveos] re-render:", reason);
+  } catch (err) {
+    // Never spin on "Loading…" forever: a failed data call is a visible
+    // error with a retry, not a silent stall.
+    console.error("[liveos] load failed:", err);
+    app.innerHTML = `<section class="block"><h1>Couldn't load LiveOS data</h1><p>${escapeHtml(err?.message || String(err))}</p><p><button class="btn btn-primary" id="retryBtn">Retry</button></p></section>`;
+    document.getElementById("retryBtn")?.addEventListener("click", () => refresh("retry"));
+  }
 }
 
 function enrich(kind, payload) {

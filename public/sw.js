@@ -1,7 +1,7 @@
 // Nova LiveOS service worker — v0.1.0
 // Caches the static shell only. All data (modules, screens, records) is
 // fetched live from the data layer and is never baked into the cache.
-const CACHE = "liveos-shell-0.1.0";
+const CACHE = "liveos-shell-0.1.1";
 const SHELL = [
   "./", "./index.html", "./styles.css", "./app.js", "./config.js",
   "./manifest.webmanifest", "./favicon.ico",

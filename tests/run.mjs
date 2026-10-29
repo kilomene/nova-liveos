@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { renderBlock, renderScreen, fillTemplate, escapeHtml } from "../public/lib/core.mjs";
-import { createLocalStore, selectMode } from "../public/lib/data.mjs";
+import { createLocalStore, selectMode, SupabaseAdapter, isUuid } from "../public/lib/data.mjs";
 import { SEED } from "../public/lib/seed-data.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -94,6 +94,28 @@ check("a fresh store is independent", store2.getScreen("team-board", "main").lay
 check("empty config selects local mode", selectMode({}) === "local");
 check("placeholder config selects local mode", selectMode({ supabaseUrl: "https://x.supabase.co", supabaseAnonKey: "YOUR-KEY" }) === "local");
 check("real config selects supabase mode", selectMode({ supabaseUrl: "https://abcd1234.supabase.co", supabaseAnonKey: "a".repeat(40) }) === "supabase");
+
+// -------------------------------------- supabase adapter identity (uuid)
+// Regression guard for the live defect: a non-UUID per-browser id makes the
+// module_installs query (user_id is a uuid column) fail, getState() rejects,
+// and the shell never renders — stuck on "Loading…" forever.
+const sbCfg = { supabaseUrl: "https://abcd1234.supabase.co", supabaseAnonKey: "a".repeat(40) };
+const sb1 = new SupabaseAdapter(sbCfg);
+check("supabase adapter userId is a uuid", isUuid(sb1.userId));
+const memLS = new Map();
+globalThis.localStorage = { getItem: (k) => (memLS.has(k) ? memLS.get(k) : null), setItem: (k, v) => memLS.set(k, String(v)), removeItem: (k) => memLS.delete(k) };
+memLS.set("liveos.userId", "user_legacybad");
+const sb2 = new SupabaseAdapter(sbCfg);
+check("legacy non-uuid stored id is replaced with a uuid", isUuid(sb2.userId) && sb2.userId !== "user_legacybad");
+check("uuid id persists to storage", memLS.get("liveos.userId") === sb2.userId);
+const sb3 = new SupabaseAdapter(sbCfg);
+check("uuid id is stable across constructions", sb3.userId === sb2.userId);
+delete globalThis.localStorage;
+
+// Migration 0002 must exist and replace the auth.uid()-bound install policy.
+const mig2 = readFileSync(join(root, "supabase/migrations/0002_installs_anon.sql"), "utf8");
+check("migration 0002 drops the auth-bound installs write policy", mig2.includes('drop policy if exists "installs own write"'));
+check("migration 0002 adds anon insert and delete install policies", mig2.includes('"installs anon insert"') && mig2.includes('"installs anon delete"'));
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);
