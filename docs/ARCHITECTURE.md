@@ -1,4 +1,4 @@
-# Nova LiveOS architecture — v0.1.0
+# Nova LiveOS architecture — v1.0.0
 
 ## Principle
 
@@ -76,16 +76,18 @@ One interface, two implementations (`public/lib/data.mjs`), selected from
 
 Adding a backend later means adding an adapter, not touching the shell.
 
-## Security posture (v0.1.0)
+## Security posture (v1.0.0)
 
 - The shell only ever contains the **anon** key. There is no service-role key
   in the repo, the config, or the client.
 - RLS is enabled on every kernel table. Published modules/screens are
   world-readable; installs and record writes are scoped to their owner;
-  `audit_log` is insert-only from clients.
-- Policies are written to work both anonymously (v0.1.0 local user id for
-  installs) and with Supabase Auth sessions (`auth.uid()`), so sign-in can be
-  enabled without a migration.
+  clients can insert into `audit_log` but never update or delete it.
+- Policies work both anonymously (per-browser UUID for installs) and with
+  Supabase Auth sessions (`auth.uid()`). v1.0's Admin Console writes the
+  catalogue through the pragmatic policies listed in migration 0003's
+  header — the documented follow-up is binding those writes to an admin
+  role check once a deployment wants per-admin enforcement.
 
 ## Failure thinking
 

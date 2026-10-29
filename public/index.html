@@ -12,6 +12,7 @@
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
+<div id="offlineBanner" class="offline-banner">You are offline — the shell keeps working from its cache and fixture of the data; changes will sync when you reconnect.</div>
 <div id="drawerOverlay" class="drawer-overlay"></div>
 <aside id="drawer" class="drawer" aria-label="Navigation">
   <div class="drawer-head">
@@ -22,19 +23,44 @@
     </div>
   </div>
   <div class="drawer-status"><span id="liveDot" class="live-dot"></span><span id="liveStatus">Connecting…</span></div>
+  <div id="drawerAccount" class="drawer-account"></div>
   <nav id="drawerNav" class="drawer-nav"></nav>
-  <div class="drawer-foot">A Nova company · v0.1.0</div>
+  <div class="drawer-foot">A Nova company · v1.0.0</div>
 </aside>
 
 <header class="topbar">
   <button id="menuBtn" class="icon-btn" aria-label="Open menu">☰</button>
   <img class="topbar-logo" src="assets/nova-logo.jpg" alt="Nova logo">
   <div class="topbar-title">Nova LiveOS</div>
+  <span id="presenceChip" class="presence-chip" title="Shells active in the last 45 seconds"></span>
   <span id="modePill" class="mode-pill">local</span>
+  <button id="searchBtn" class="icon-btn" aria-label="Search and commands" title="Search & commands (Ctrl+K)">
+    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="11" cy="11" r="6.5"/><line x1="16" y1="16" x2="20.5" y2="20.5"/></svg>
+  </button>
+  <button id="bellBtn" class="icon-btn badge-btn" aria-label="Notifications">
+    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M6 16v-5a6 6 0 0 1 12 0v5l1.5 3h-15z"/><path d="M10 21a2.2 2.2 0 0 0 4 0"/></svg>
+    <span id="bellBadge" class="badge" style="display:none">0</span>
+  </button>
+  <button id="cartBtn" class="icon-btn badge-btn" aria-label="Cart">
+    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="9.5" cy="20" r="1.3"/><circle cx="17" cy="20" r="1.3"/><path d="M3 3.5h2l2.4 11h9.8l2-7.5H6.2"/></svg>
+    <span id="cartBadge" class="badge" style="display:none">0</span>
+  </button>
   <button id="simulateBtn" class="btn btn-ghost simulate-btn" title="Change a screen definition in the data layer and watch the shell update in place">Simulate live change</button>
 </header>
 
-<main id="app" class="app"><p class="loading">Loading…</p></main>
+<div id="palette" class="palette" role="dialog" aria-label="Search and commands">
+  <div id="paletteOverlay" class="palette-overlay"></div>
+  <div class="palette-panel">
+    <input id="paletteInput" class="palette-input" type="text" placeholder="Search modules, records… or type a command" autocomplete="off">
+    <div id="paletteResults" class="palette-results"></div>
+    <div class="palette-foot">↑↓ navigate · Enter select · Esc close</div>
+  </div>
+</div>
+
+<main id="app" class="app">
+  <section class="block hero"><div class="skel skel-title"></div><div class="skel skel-line"></div><div class="skel skel-line short"></div></section>
+  <section class="block stats"><div class="stat"><div class="skel skel-num"></div><div class="skel skel-line short"></div></div><div class="stat"><div class="skel skel-num"></div><div class="skel skel-line short"></div></div><div class="stat"><div class="skel skel-num"></div><div class="skel skel-line short"></div></div></section>
+</main>
 <div id="toast" class="toast" role="status"></div>
 
 <script src="config.js"></script>

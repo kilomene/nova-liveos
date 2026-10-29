@@ -9,7 +9,7 @@ data, and is pushed to every installed copy **live, in real time**. Change a
 row in the database and every copy in the world updates itself. No server to
 run, no redeploy, no app-store update.
 
-Version 0.1.0 · A Nova company
+Version 1.0.0 "Advanced" · A Nova company
 
 ## Why this exists
 
@@ -33,10 +33,13 @@ simply gone.
 ## Modules are data
 
 A *module* is a row in the `modules` table plus its *screens* — layout
-documents (JSON arrays of blocks: hero, text, stats, cards, list, form,
-action-button) that the shell renders generically. Installing a module is a
-row in `module_installs`. A module's own data — products, notes, jobs, orders,
-bids — lives in one generic `records` table as JSON payloads.
+documents (JSON arrays of blocks) that the shell renders generically.
+Installing a module is a row in `module_installs`. A module's own data —
+tasks, messages, products, orders, jobs, bids, contacts — lives in one
+generic `records` table as JSON payloads. Each module carries its own
+hand-crafted SVG app icon (a slug from the shell's icon library, stored in
+the module's manifest) shown in the drawer, the Store, on Home and in
+search results.
 
 That means a new product feature can be shipped by inserting rows:
 
@@ -44,13 +47,44 @@ That means a new product feature can be shipped by inserting rows:
 2. It appears in the Module Store for every user.
 3. They install it; it appears in their navigation — live, with no app update.
 
-Three proof modules ship in the seed and work end-to-end:
+## What's in v1.0.0 "Advanced"
+
+- **Real-time everything** — modules, screens, records, kanban moves, chat,
+  orders, bids, analytics, notifications, the audit feed and presence all
+  update in every open shell with no reload (Realtime `postgres_changes`,
+  5-second polling floor; in local mode, a cross-tab storage bus). Every
+  mutation is optimistic: instant local echo, then server confirmation.
+  Proven end-to-end by a two-shell browser test.
+- **Authentication** — Supabase Auth over plain REST: email + password,
+  magic links, persisted sessions with refresh. Signing in swaps the shell
+  identity to your account and migrates your anonymous installs.
+- **Admin Console** — Screen Editor (structured block editor with live
+  preview), Module Manager (create/edit/publish, visual icon picker),
+  Records Browser, Activity (audit log), Automations.
+- **An automation engine in the shell** — enabled rules evaluate the moment
+  data changes (an order lands in the Analytics activity stream; a bid is
+  logged; a job posting is audited) and every run is written to the audit
+  log. Database triggers (migration 0003) independently audit *all* changes.
+- **A richer renderer** — kanban (drag between columns), sortable tables,
+  galleries, hand-rolled SVG bar/line charts from live record aggregations,
+  a safe markdown subset, dividers, notes and a cart block — on top of the
+  original seven block types.
+- **Platform furniture** — global search + command palette (Ctrl+K),
+  notifications centre with unread badge, live presence count, keyboard
+  shortcuts, PWA install prompt, offline banner, skeleton loaders, animated
+  counters — under a classical white Nova design: serif display type, the
+  real Nova logo, green/pink used sparingly.
+
+Six modules ship in the seed and work end-to-end:
 
 | Module | Proves | Try it |
 |---|---|---|
-| **Team Board** | Collaboration | Add a note; it appears in the shared list and persists |
-| **Mini Shop** | Commerce | Products are records; ordering writes an order record |
-| **Agent Floor** | Agents | Post a job; bid on a job; agents are records too |
+| **Team Board** | Collaboration | A real kanban: add a task, drag it to Done — every shell follows |
+| **Team Chat** | Live messaging | Post a message; it appears in every open shell instantly |
+| **Mini Shop** | Commerce | Fill a cart, check out; the order joins the shared history |
+| **Agent Floor** | Agents | Post a job; bid on it; watch the job's bid count update live |
+| **Analytics** | Insight | Charts computed live from records across all modules |
+| **Contacts CRM** | Business data | Add a contact; sort the table; move them through the pipeline board |
 
 ## Install your own copy
 
@@ -102,11 +136,18 @@ There is deliberately no box labelled "our server".
 
 ```
 public/          the shell (index.html, app.js, styles.css, config.js,
-                 manifest.webmanifest, sw.js, lib/ data layer + renderer)
+                 manifest.webmanifest, sw.js)
+  lib/           core.mjs renderer · data.mjs adapters · icons.mjs icon
+                 library · features.mjs cart/search/admin/automation logic
+                 auth.mjs Supabase Auth REST client · net.mjs resilient fetch
+                 seed-data.mjs local fixtures (mirrors supabase/seed.sql)
 supabase/
   migrations/    0001_kernel.sql — kernel schema, RLS, realtime publication
-  seed.sql       the three proof modules, their screens and demo data
+                 0002_installs_anon.sql — per-browser install policies
+                 0003_advanced.sql — audit triggers, admin/automation policies
+  seed.sql       the six modules, their screens and demo data
 install.sh       idempotent installer (fail-closed)
 docs/            INSTALL.md, ARCHITECTURE.md
-tests/           run.mjs (unit suite), browser_pass.py (Chromium QA pass)
+tests/           run.mjs (unit suite), browser_pass.py (Chromium QA pass,
+                 incl. the two-shell real-time acceptance)
 ```
