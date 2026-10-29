@@ -1,4 +1,4 @@
-// Nova LiveOS test suite — v1.0.1. Zero dependencies: `node tests/run.mjs`.
+// Nova LiveOS test suite — v1.0.2. Zero dependencies: `node tests/run.mjs`.
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -340,7 +340,7 @@ check("migration 0003 widens records update/delete to null-created rows", mig3.i
 check("migration 0003 seeds the engine automations", mig3.includes("order-activity") && mig3.includes("bid-activity") && mig3.includes("job-audit"));
 check("migration 0003 has no service-role key", !/service_role|SERVICE_ROLE/.test(mig3));
 const swJs = readFileSync(join(root, "public/sw.js"), "utf8");
-check("service worker cache is liveos-shell-1.0.1", swJs.includes('liveos-shell-1.0.1'));
+check("service worker cache is liveos-shell-1.0.2", swJs.includes('liveos-shell-1.0.2'));
 check("service worker caches the new lib modules", swJs.includes("icons.mjs") && swJs.includes("features.mjs") && swJs.includes("auth.mjs") && swJs.includes("net.mjs"));
 // v1.0.1 defect 1: the fetch handler must be network-first — the network
 // fetch must appear before any cache lookup in the handler, and the cache
@@ -350,9 +350,9 @@ check("service worker fetch handler is network-first", fetchHandler.indexOf("fet
 check("service worker still bypasses cross-origin/non-GET", fetchHandler.includes('url.origin !== location.origin') && fetchHandler.includes('e.request.method !== "GET"'));
 const appJs = readFileSync(join(root, "public/app.js"), "utf8");
 check("app registers a controllerchange auto-reload guard", appJs.includes("controllerchange") && appJs.includes("liveos.swReloaded") && appJs.includes("sessionStorage"));
-check("app version header is v1.0.1", appJs.includes("Nova LiveOS shell — v1.0.1"));
+check("app version header is v1.0.2", appJs.includes("Nova LiveOS shell — v1.0.2"));
 const indexHtml = readFileSync(join(root, "public/index.html"), "utf8");
-check("index footer says v1.0.1", indexHtml.includes("A Nova company · v1.0.1"));
+check("index footer says v1.0.2", indexHtml.includes("A Nova company · v1.0.2"));
 check("index has palette + account + badges mounts", indexHtml.includes('id="palette"') && indexHtml.includes('id="drawerAccount"') && indexHtml.includes('id="bellBadge"'));
 
 // ============================================================ v1.0.1 sections
@@ -413,6 +413,24 @@ const dayLine = renderBlock({ type: "chart", title: "Activity by day", chart: "l
 check("day line chart shows the full 10-29 label", dayLine.includes(">10-29<"));
 const firstCx = Number((dayLine.match(/<circle cx="([\d.]+)"/) || [])[1]);
 check("day line chart first point is padded from the edge (no label clipping)", firstCx >= 30, `cx=${firstCx}`);
+
+// ============================================================ v1.0.2 sections
+// ------------------------------------------------- SW self-rescue (defect: a page open on a pre-guard shell
+// never loads the new app.js, so the escape must live in sw.js itself —
+// the browser's SW update check is the one delivery that bypasses the
+// old worker). Static assertions on the worker's source.
+check("sw header is v1.0.2", swJs.includes("service worker — v1.0.2"));
+check("sw self-rescue collects window clients on activate", swJs.includes("clients.matchAll") && swJs.includes('type: "window"') && swJs.includes("includeUncontrolled"));
+check("sw self-rescue force-navigates clients onto the new shell", swJs.includes("client.navigate(client.url)"));
+check("sw self-rescue is gated on replacing a different version (stale caches existed)",
+  swJs.includes("replacedDifferentVersion") && swJs.indexOf("if (!replacedDifferentVersion) return") >= 0 &&
+  swJs.indexOf("if (!replacedDifferentVersion) return") < swJs.indexOf("client.navigate"));
+check("sw self-rescue navigates only after claiming clients",
+  swJs.indexOf("clients.claim()") >= 0 && swJs.indexOf("clients.claim()") < swJs.indexOf("client.navigate"));
+check("sw self-rescue feature-checks navigate and guards same-origin",
+  swJs.includes('typeof client.navigate !== "function"') && swJs.includes("new URL(client.url).origin !== self.location.origin"));
+check("sw self-rescue fires navigate DETACHED (awaiting it inside activate deadlocks Chromium)",
+  !swJs.includes("await client.navigate") && swJs.includes("setTimeout"));
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

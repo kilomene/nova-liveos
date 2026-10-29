@@ -1,4 +1,4 @@
-// Nova LiveOS icon library — v1.0.1
+// Nova LiveOS icon library — v1.0.2
 // Hand-crafted inline SVG icons: one consistent classical style (24×24 grid,
 // 1.7 stroke, round caps/joins, ink strokes with sparing green/pink accents)
 // designed for the white Nova theme. Icons are data: a module's manifest

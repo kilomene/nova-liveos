@@ -1,4 +1,4 @@
-// Nova LiveOS data layer — v1.0.1
+// Nova LiveOS data layer — v1.0.2
 // Two adapters behind one interface:
 //   LocalAdapter    — fixture data in localStorage (works offline, no account)
 //   SupabaseAdapter — PostgREST via fetch with the anon key (or the signed-in
