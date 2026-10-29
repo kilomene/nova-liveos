@@ -1,4 +1,4 @@
-// Nova LiveOS auth — v1.0.3
+// Nova LiveOS auth — v1.0.4
 // Supabase Auth over plain REST (zero dependencies, fetch only):
 //   POST /auth/v1/signup                        email + password sign-up
 //   POST /auth/v1/token?grant_type=password     sign-in

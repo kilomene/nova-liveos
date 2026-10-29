@@ -1,4 +1,4 @@
-// Nova LiveOS feature logic — v1.0.3
+// Nova LiveOS feature logic — v1.0.4
 // Pure, testable logic shared by the shell and the test suite: cart maths,
 // kanban moves, global search, notification derivation, the admin block
 // editor model, and the in-shell automation engine.

@@ -1,4 +1,4 @@
-// Nova LiveOS data layer — v1.0.3
+// Nova LiveOS data layer — v1.0.4
 // Two adapters behind one interface:
 //   LocalAdapter    — fixture data in localStorage (works offline, no account)
 //   SupabaseAdapter — PostgREST via fetch with the anon key (or the signed-in
@@ -518,21 +518,24 @@ export class SupabaseAdapter {
     }, { Prefer: "return=minimal" });
     return true;
   }
-  // Presence: one tiny heartbeat row per shell per beat in the records table
-  // (module liveos-core, filtered out of every normal record read). Counting
-  // distinct shell ids inside the freshness window gives live presence.
+  // Presence (v1.0.4): ONE row per shell in presence_beats (shell_id is
+  // the primary key), upserted in place on every beat — the table never
+  // grows, and beats never touch records or audit_log again. (v1.0–v1.0.3
+  // inserted a full records row per beat and the audit trigger mirrored
+  // each one; in ~5.5h that churn alone grew records 19 -> 1,771 and
+  // audit_log 0 -> 1,752.) Counting rows inside the freshness window
+  // gives live presence.
   async heartbeat() {
-    await this._req("POST", "records", {
-      module_slug: PRESENCE_MODULE, kind: "presence",
-      payload: { shell: this.shellId }, created_by: null
-    }, { Prefer: "return=minimal" });
+    await this._req("POST", "presence_beats?on_conflict=shell_id", {
+      shell_id: this.shellId, seen_at: new Date().toISOString()
+    }, { Prefer: "resolution=merge-duplicates,return=minimal" });
     return this.getPresenceCount();
   }
   async getPresenceCount() {
     const since = new Date(Date.now() - PRESENCE_WINDOW_MS).toISOString();
     const rows = await this._get(
-      `records?select=payload&module_slug=eq.${PRESENCE_MODULE}&kind=eq.presence&created_at=gte.${encodeURIComponent(since)}&order=created_at.desc&limit=500`);
-    const shells = new Set((rows || []).map((r) => r.payload?.shell).filter(Boolean));
+      `presence_beats?select=shell_id,seen_at&seen_at=gte.${encodeURIComponent(since)}`);
+    const shells = new Set((rows || []).map((r) => r.shell_id).filter(Boolean));
     shells.add(this.shellId);
     return shells.size;
   }
@@ -603,6 +606,15 @@ export class SupabaseAdapter {
   // postgres_changes on the kernel tables incl. audit + automations).
   // Whether or not the socket connects, a 5s poll compares a state hash and
   // fires on change, so the shell always re-renders live without a reload.
+  //
+  // v1.0.4 RESILIENCE: the v1.0.3 socket never sent phoenix heartbeats
+  // (the server drops a silent channel) and had no close/error handling,
+  // so ONE drop killed realtime until a manual reload — only the poll
+  // kept sync, and the shell felt off-and-on. Now the socket sends a
+  // phoenix heartbeat every 25s while open, and any close/error
+  // schedules a reconnect with capped backoff (1s, 2s, 5s, 10s, 30s)
+  // that re-joins the channel on reopen. There is never more than one
+  // live socket, and the returned unsubscribe stops everything.
   onChange(fn) {
     let stopped = false;
     const poll = async () => {
@@ -616,31 +628,84 @@ export class SupabaseAdapter {
     this._hash = "";
     poll();
     this._timer = setInterval(poll, 5000);
-    try {
-      const wsUrl = `${this.url.replace(/^http/, "ws")}/realtime/v1/websocket?apikey=${this.key}&vsn=1.0.0`;
-      this._ws = new WebSocket(wsUrl);
-      this._ws.onopen = () => {
-        this._ws.send(JSON.stringify({
-          topic: "realtime:liveos", event: "phx_join", payload: { config: { broadcast: { self: false },
-            postgres_changes: [
-              { event: "*", schema: "public", table: "screens" },
-              { event: "*", schema: "public", table: "modules" },
-              { event: "*", schema: "public", table: "records" },
-              { event: "*", schema: "public", table: "module_installs" },
-              { event: "*", schema: "public", table: "automations" },
-              { event: "*", schema: "public", table: "audit_log" }
-            ] } }, ref: "1"
-        }));
+
+    const BACKOFF_MS = [1000, 2000, 5000, 10000, 30000];
+    let ws = null;
+    let heartbeatTimer = null;
+    let reconnectTimer = null;
+    let backoffStep = 0;
+    let refCounter = 0;
+    const nextRef = () => String(++refCounter);
+
+    const stopHeartbeat = () => {
+      if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+    };
+    const scheduleReconnect = () => {
+      if (stopped || reconnectTimer) return;
+      const delay = BACKOFF_MS[Math.min(backoffStep, BACKOFF_MS.length - 1)];
+      backoffStep += 1;
+      reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, delay);
+    };
+    const connect = () => {
+      if (stopped) return;
+      let socket;
+      try {
+        const wsUrl = `${this.url.replace(/^http/, "ws")}/realtime/v1/websocket?apikey=${this.key}&vsn=1.0.0`;
+        socket = new WebSocket(wsUrl);
+      } catch { scheduleReconnect(); return; }
+      ws = socket;
+      this._ws = socket;
+      socket.onopen = () => {
+        if (stopped || ws !== socket) return;
+        backoffStep = 0;
+        try {
+          socket.send(JSON.stringify({
+            topic: "realtime:liveos", event: "phx_join", payload: { config: { broadcast: { self: false },
+              postgres_changes: [
+                { event: "*", schema: "public", table: "screens" },
+                { event: "*", schema: "public", table: "modules" },
+                { event: "*", schema: "public", table: "records" },
+                { event: "*", schema: "public", table: "module_installs" },
+                { event: "*", schema: "public", table: "automations" },
+                { event: "*", schema: "public", table: "audit_log" }
+              ] } }, ref: nextRef()
+          }));
+        } catch { /* a failed join send surfaces via close/error -> reconnect */ }
+        stopHeartbeat();
+        heartbeatTimer = setInterval(() => {
+          try { socket.send(JSON.stringify({ topic: "phoenix", event: "heartbeat", payload: {}, ref: nextRef() })); }
+          catch { /* a failed heartbeat send surfaces via close/error -> reconnect */ }
+        }, 25000);
       };
-      this._ws.onmessage = (msg) => {
-        if (stopped) return;
+      socket.onmessage = (msg) => {
+        if (stopped || ws !== socket) return;
         const text = String(msg.data);
         if (!text.includes("postgres_changes")) return;
         if (isPresenceChangePayload(text)) return; // heartbeats never render
         fn({ type: "realtime" });
       };
-    } catch { /* polling fallback covers it */ }
-    return () => { stopped = true; clearInterval(this._timer); try { this._ws?.close(); } catch {} };
+      const onDead = () => {
+        stopHeartbeat();
+        if (ws === socket) { ws = null; this._ws = null; }
+        else if (ws) return; // a newer socket is live; this corpse is not ours to bury
+        scheduleReconnect();
+      };
+      socket.onclose = onDead;
+      socket.onerror = () => {
+        try { socket.close(); } catch { /* already gone */ }
+        onDead();
+      };
+    };
+    connect();
+    return () => {
+      stopped = true;
+      clearInterval(this._timer);
+      stopHeartbeat();
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      const socket = ws || this._ws;
+      ws = null; this._ws = null;
+      try { socket?.close(); } catch {}
+    };
   }
 }
 

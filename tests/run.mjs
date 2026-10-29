@@ -1,4 +1,4 @@
-// Nova LiveOS test suite — v1.0.3. Zero dependencies: `node tests/run.mjs`.
+// Nova LiveOS test suite — v1.0.4. Zero dependencies: `node tests/run.mjs`.
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -7,7 +7,7 @@ import { createLocalStore, selectMode, SupabaseAdapter, isUuid, isPresenceChange
 import { SEED } from "../public/lib/seed-data.mjs";
 import { ICONS, ICON_SLUGS, isIconSlug, iconSvg, moduleIconSlug, moduleIcon } from "../public/lib/icons.mjs";
 import { cartAdd, cartSetQty, cartRemove, cartView, cartSummary, moveRecordStatus, buildSearchIndex, searchIndex, notificationsFrom, isPresenceRecord, isPresenceAudit, BLOCK_SCHEMAS, BLOCK_TYPES, addBlock, removeBlock, moveBlockInLayout, applyBlockEdit, runAutomations, automationMatches } from "../public/lib/features.mjs";
-import { fetchWithRetry, isNetworkError, noteDataSuccess, noteDataFailure, getDataOnline, onDataConnectivity } from "../public/lib/net.mjs";
+import { fetchWithRetry, isNetworkError, noteDataSuccess, noteDataFailure, getDataOnline, onDataConnectivity, OFFLINE_AFTER_FAILURES, getConsecutiveDataFailures } from "../public/lib/net.mjs";
 import { sessionFromAuthResponse, parseStoredSession, isSessionExpired, displayNameFromEmail, AuthClient } from "../public/lib/auth.mjs";
 import { SNAPSHOT_KEY, SNAPSHOT_VERSION, MAX_SNAPSHOT_AGE_MS, snapshotIdentity, buildSnapshot, parseSnapshot, readSnapshot, writeSnapshot } from "../public/lib/snapshot.mjs";
 import { settle, createCycleTracker, buildCandidate, dataStatesEqual } from "../public/lib/refresh.mjs";
@@ -342,7 +342,7 @@ check("migration 0003 widens records update/delete to null-created rows", mig3.i
 check("migration 0003 seeds the engine automations", mig3.includes("order-activity") && mig3.includes("bid-activity") && mig3.includes("job-audit"));
 check("migration 0003 has no service-role key", !/service_role|SERVICE_ROLE/.test(mig3));
 const swJs = readFileSync(join(root, "public/sw.js"), "utf8");
-check("service worker cache is liveos-shell-1.0.3", swJs.includes('liveos-shell-1.0.3'));
+check("service worker cache is liveos-shell-1.0.4", swJs.includes('liveos-shell-1.0.4'));
 check("service worker caches the new lib modules", swJs.includes("icons.mjs") && swJs.includes("features.mjs") && swJs.includes("auth.mjs") && swJs.includes("net.mjs") && swJs.includes("snapshot.mjs") && swJs.includes("refresh.mjs") && swJs.includes("patch.mjs"));
 // v1.0.1 defect 1: the fetch handler must be network-first — the network
 // fetch must appear before any cache lookup in the handler, and the cache
@@ -352,9 +352,9 @@ check("service worker fetch handler is network-first", fetchHandler.indexOf("fet
 check("service worker still bypasses cross-origin/non-GET", fetchHandler.includes('url.origin !== location.origin') && fetchHandler.includes('e.request.method !== "GET"'));
 const appJs = readFileSync(join(root, "public/app.js"), "utf8");
 check("app registers a controllerchange auto-reload guard", appJs.includes("controllerchange") && appJs.includes("liveos.swReloaded") && appJs.includes("sessionStorage"));
-check("app version header is v1.0.3", appJs.includes("Nova LiveOS shell — v1.0.3"));
+check("app version header is v1.0.4", appJs.includes("Nova LiveOS shell — v1.0.4"));
 const indexHtml = readFileSync(join(root, "public/index.html"), "utf8");
-check("index footer says v1.0.3", indexHtml.includes("A Nova company · v1.0.3"));
+check("index footer says v1.0.4", indexHtml.includes("A Nova company · v1.0.4"));
 check("index has palette + account + badges mounts", indexHtml.includes('id="palette"') && indexHtml.includes('id="drawerAccount"') && indexHtml.includes('id="bellBadge"'));
 
 // ============================================================ v1.0.1 sections
@@ -388,17 +388,25 @@ noteDataSuccess();
 check("connectivity starts online after a success", getDataOnline() === true);
 let connEvents = [];
 const unsubConn = onDataConnectivity((v) => connEvents.push(v));
+// v1.0.4: the offline flip is gated — it takes THREE consecutive network
+// failures (the anti-flap gate proven in detail at the end of the suite).
+// These checks keep their v1.0.1 meaning under the gate: the flip
+// notifies once, HTTP errors never count, a success restores.
 noteDataFailure(new TypeError("Failed to fetch"));
-check("a network failure flips connectivity offline + notifies", getDataOnline() === false && connEvents.join() === "false");
+noteDataFailure(new TypeError("Failed to fetch"));
+noteDataFailure(new TypeError("Failed to fetch"));
+check("three consecutive network failures flip connectivity offline + notify once", getDataOnline() === false && connEvents.join() === "false");
 noteDataFailure(Object.assign(new Error("HTTP 503"), { status: 503 }));
 check("an HTTP error does not change connectivity state", getDataOnline() === false && connEvents.length === 1);
 noteDataSuccess();
 check("the next success restores connectivity + notifies", getDataOnline() === true && connEvents.join() === "false,true");
 unsubConn();
 let netErr = null;
-try { await fetchWithRetry("https://down.example", {}, { fetchImpl: async () => { throw new TypeError("Failed to fetch"); }, retries: 0, backoffMs: 1 }); }
-catch (e) { netErr = e; }
-check("fetchWithRetry network failure drives connectivity offline", !!netErr && getDataOnline() === false);
+for (let i = 0; i < 3; i++) {
+  try { await fetchWithRetry("https://down.example", {}, { fetchImpl: async () => { throw new TypeError("Failed to fetch"); }, retries: 0, backoffMs: 1 }); }
+  catch (e) { netErr = e; }
+}
+check("repeated fetchWithRetry network failures drive connectivity offline", !!netErr && getDataOnline() === false);
 const okRes = await fetchWithRetry("https://up.example", {}, { fetchImpl: async () => ({ ok: true, status: 200 }), retries: 0 });
 check("fetchWithRetry success drives connectivity back online", okRes.ok && getDataOnline() === true);
 check("app banner is driven by the data layer, never navigator.onLine", !appJs.includes("navigator.onLine") && appJs.includes("getDataOnline()") && appJs.includes('refresh("online-event")'));
@@ -421,7 +429,7 @@ check("day line chart first point is padded from the edge (no label clipping)", 
 // never loads the new app.js, so the escape must live in sw.js itself —
 // the browser's SW update check is the one delivery that bypasses the
 // old worker). Static assertions on the worker's source.
-check("sw header is v1.0.3", swJs.includes("service worker — v1.0.3"));
+check("sw header is v1.0.4", swJs.includes("service worker — v1.0.4"));
 check("sw self-rescue collects window clients on activate", swJs.includes("clients.matchAll") && swJs.includes('type: "window"') && swJs.includes("includeUncontrolled"));
 check("sw self-rescue force-navigates clients onto the new shell", swJs.includes("client.navigate(client.url)"));
 check("sw self-rescue is gated on replacing a different version (stale caches existed)",
@@ -540,6 +548,177 @@ check("app gates badge + nav writes behind value signatures",
   appJs.includes("badgeCache.presence") && appJs.includes("lastNavSig"));
 check("auth transitions render explicitly (session is not a refresh data class, so the gate must not swallow it)",
   appJs.includes('await refresh("auth");\n  render();') && appJs.includes('await refresh("signout");\n  render();'));
+
+// ============================================================ v1.0.4 sections
+// ------------------------------------------------- migration 0005 (presence)
+const mig5 = readFileSync(join(root, "supabase/migrations/0005_presence_and_stability.sql"), "utf8");
+check("migration 0005 creates presence_beats keyed by shell",
+  /create table if not exists public\.presence_beats/.test(mig5) && mig5.includes("shell_id text primary key") && mig5.includes("seen_at timestamptz not null default now()"));
+check("migration 0005 enables RLS on presence_beats", mig5.includes("alter table public.presence_beats enable row level security"));
+check("migration 0005 adds pragmatic select/insert/update/delete policies",
+  mig5.includes('"presence_beats anon select"') && mig5.includes('"presence_beats anon insert"') &&
+  mig5.includes('"presence_beats anon update"') && mig5.includes('"presence_beats anon delete"'));
+check("migration 0005 does NOT put presence_beats in the realtime publication",
+  !mig5.includes("alter publication supabase_realtime add table public.presence_beats"));
+check("migration 0005 puts no audit trigger on presence_beats", !mig5.includes("create trigger"));
+check("migration 0005 exempts liveos-core records from the audit trigger",
+  mig5.includes("liveos_audit_change") && mig5.includes("TG_TABLE_NAME = 'records' and mod = 'liveos-core'"));
+check("migration 0005 keeps the 0004 null-safe jsonb field handling",
+  mig5.includes("to_jsonb(old)") && mig5.includes("to_jsonb(new)") && mig5.includes("coalesce(j ->> 'module_slug', '')"));
+check("migration 0005 purges legacy presence records + audit mirrors",
+  mig5.includes("delete from public.records where module_slug = 'liveos-core'") &&
+  mig5.includes("delete from public.audit_log where detail ->> 'module_slug' = 'liveos-core'"));
+check("migration 0005 has no service-role key", !/service_role|SERVICE_ROLE/.test(mig5));
+
+// ------------------------------------------- presence beats (supabase adapter)
+// Mock fetch at the REST boundary: heartbeat must UPSERT one row into
+// presence_beats and NEVER write to records / audit_log again.
+const restCalls = [];
+const realFetchBackup = globalThis.fetch;
+globalThis.fetch = async (url, opts = {}) => {
+  const u = String(url);
+  restCalls.push({ url: u, method: opts.method || "GET", headers: opts.headers || {}, body: opts.body });
+  if (u.includes("/rest/v1/presence_beats") && (opts.method || "GET") === "POST") {
+    return { ok: true, status: 201, text: async () => "" };
+  }
+  if (u.includes("/rest/v1/presence_beats")) {
+    return { ok: true, status: 200, text: async () => JSON.stringify([
+      { shell_id: "shell-other", seen_at: new Date().toISOString() },
+      { shell_id: "shell-third", seen_at: new Date().toISOString() }
+    ]) };
+  }
+  return { ok: true, status: 200, text: async () => "[]" };
+};
+const sbPresence = new SupabaseAdapter(sbCfg);
+const presenceCount = await sbPresence.heartbeat();
+const beatPost = restCalls.find((c) => c.method === "POST");
+check("heartbeat upserts into presence_beats with on_conflict=shell_id",
+  !!beatPost && beatPost.url.includes("/rest/v1/presence_beats?on_conflict=shell_id"), beatPost?.url || "no POST seen");
+check("heartbeat upsert asks for merge-duplicates resolution",
+  String(beatPost?.headers?.Prefer || "").includes("resolution=merge-duplicates"), beatPost?.headers?.Prefer || "");
+const beatBody = JSON.parse(beatPost?.body || "{}");
+check("heartbeat body carries this shell's id + a seen_at timestamp",
+  beatBody.shell_id === sbPresence.shellId && typeof beatBody.seen_at === "string" && !Number.isNaN(Date.parse(beatBody.seen_at)));
+check("heartbeat NEVER writes to records or audit_log",
+  !restCalls.some((c) => c.url.includes("/rest/v1/records") || c.url.includes("/rest/v1/audit_log")),
+  restCalls.map((c) => c.url).join(" | "));
+check("heartbeat returns the live presence count from presence_beats", presenceCount === 3, `got ${presenceCount}`);
+restCalls.length = 0;
+const countOnly = await sbPresence.getPresenceCount();
+const countGet = restCalls.find((c) => c.method === "GET");
+check("presence count reads presence_beats with the windowed seen_at filter",
+  countOnly === 3 && !!countGet && countGet.url.includes("/rest/v1/presence_beats?select=shell_id,seen_at") && countGet.url.includes("seen_at=gte."),
+  countGet?.url || "no GET seen");
+const windowStart = Date.parse(decodeURIComponent((countGet?.url.match(/seen_at=gte\.([^&]+)/) || [])[1] || ""));
+check("the presence window start is ~45s ago (PRESENCE_WINDOW_MS)",
+  Math.abs((Date.now() - 45000) - windowStart) < 5000, `start=${windowStart}`);
+
+// ------------------------------------------------ realtime socket resilience
+// Fake socket + fake timers: the socket must heartbeat on the phoenix
+// topic, a close/error must schedule a backoff reconnect that re-joins,
+// and unsubscribe must stop EVERYTHING (no zombie sockets or timers).
+class FakeWebSocket {
+  static instances = [];
+  constructor(url) { this.url = url; this.sent = []; this.closed = false; FakeWebSocket.instances.push(this); }
+  send(data) { this.sent.push(String(data)); }
+  close() { this.closed = true; if (this.onclose) this.onclose(); }
+}
+const realSetTimeout = globalThis.setTimeout;
+function installFakeTimers() {
+  const real = {
+    setTimeout: globalThis.setTimeout, clearTimeout: globalThis.clearTimeout,
+    setInterval: globalThis.setInterval, clearInterval: globalThis.clearInterval
+  };
+  let nextId = 1;
+  const timeouts = new Map(); const intervals = new Map();
+  globalThis.setTimeout = (cb, ms, ...a) => { const id = nextId++; timeouts.set(id, { cb, ms, args: a }); return id; };
+  globalThis.clearTimeout = (id) => timeouts.delete(id);
+  globalThis.setInterval = (cb, ms, ...a) => { const id = nextId++; intervals.set(id, { cb, ms, args: a }); return id; };
+  globalThis.clearInterval = (id) => intervals.delete(id);
+  return {
+    timeouts, intervals,
+    fireTimeout(ms) { for (const [id, t] of [...timeouts]) if (t.ms === ms) { timeouts.delete(id); t.cb(...t.args); } },
+    tickInterval(ms) { for (const t of [...intervals.values()]) if (t.ms === ms) t.cb(...t.args); },
+    restore() { globalThis.setTimeout = real.setTimeout; globalThis.clearTimeout = real.clearTimeout; globalThis.setInterval = real.setInterval; globalThis.clearInterval = real.clearInterval; }
+  };
+}
+const flushMicro = async () => { await new Promise((r) => realSetTimeout(r, 0)); await new Promise((r) => realSetTimeout(r, 0)); };
+const timers = installFakeTimers();
+globalThis.WebSocket = FakeWebSocket;
+FakeWebSocket.instances = [];
+const sbLive = new SupabaseAdapter(sbCfg);
+const liveChanges = [];
+const unsubLive = sbLive.onChange((c) => liveChanges.push(c));
+check("realtime opens exactly one socket", FakeWebSocket.instances.length === 1, `got ${FakeWebSocket.instances.length}`);
+const sock1 = FakeWebSocket.instances[0];
+sock1.onopen();
+const join1 = sock1.sent.map((s) => JSON.parse(s)).find((f) => f.event === "phx_join");
+check("realtime joins the liveos channel on open", join1?.topic === "realtime:liveos", sock1.sent.join(" | "));
+timers.tickInterval(25000);
+timers.tickInterval(25000);
+const beatsSent = sock1.sent.map((s) => JSON.parse(s)).filter((f) => f.topic === "phoenix" && f.event === "heartbeat");
+check("phoenix heartbeat frames are emitted every 25s while open", beatsSent.length === 2, `got ${beatsSent.length}`);
+sock1.onclose();
+check("a socket close does not open the replacement before the backoff fires",
+  FakeWebSocket.instances.length === 1 && [...timers.timeouts.values()].some((t) => t.ms === 1000),
+  `timeouts=${[...timers.timeouts.values()].map((t) => t.ms).join(",")}`);
+timers.fireTimeout(1000);
+check("the backoff reconnect opens exactly one replacement socket", FakeWebSocket.instances.length === 2);
+const sock2 = FakeWebSocket.instances[1];
+sock2.onopen();
+check("the reconnected socket re-joins the channel",
+  sock2.sent.map((s) => JSON.parse(s)).some((f) => f.event === "phx_join" && f.topic === "realtime:liveos"), sock2.sent.join(" | "));
+check("the adapter tracks the replacement as its live socket", sbLive._ws === sock2);
+sock2.onerror(new Error("boom"));
+check("a socket error also schedules a reconnect", [...timers.timeouts.values()].some((t) => t.ms === 1000));
+await flushMicro();
+unsubLive();
+check("unsubscribe closes the socket, clears every timer, cancels the pending reconnect",
+  sock2.closed === true && timers.intervals.size === 0 && timers.timeouts.size === 0,
+  `intervals=${timers.intervals.size} timeouts=${timers.timeouts.size}`);
+timers.fireTimeout(1000);
+timers.tickInterval(25000);
+check("no socket is created and nothing fires after unsubscribe", FakeWebSocket.instances.length === 2);
+timers.restore();
+delete globalThis.WebSocket;
+globalThis.fetch = realFetchBackup;
+
+// -------------------------------------------------- anti-flap connectivity
+check("the offline gate needs three consecutive failures", OFFLINE_AFTER_FAILURES === 3);
+noteDataSuccess();
+let gateEvents = [];
+const unsubGate = onDataConnectivity((v) => gateEvents.push(v));
+const netFail = () => noteDataFailure(new TypeError("Failed to fetch"));
+netFail();
+check("gate: the 1st consecutive network failure keeps the shell online",
+  getDataOnline() === true && getConsecutiveDataFailures() === 1);
+netFail();
+check("gate: the 2nd consecutive network failure keeps the shell online",
+  getDataOnline() === true && getConsecutiveDataFailures() === 2 && gateEvents.length === 0);
+netFail();
+check("gate: the 3rd consecutive network failure flips the shell offline, notifying once",
+  getDataOnline() === false && gateEvents.join() === "false");
+netFail();
+check("gate: further failures do not re-notify", gateEvents.length === 1 && getDataOnline() === false);
+noteDataFailure(Object.assign(new Error("HTTP 503"), { status: 503 }));
+check("gate: an HTTP error neither counts nor resets the streak",
+  getConsecutiveDataFailures() === 4 && getDataOnline() === false);
+noteDataSuccess();
+check("gate: a success flips back online immediately and resets the counter",
+  getDataOnline() === true && getConsecutiveDataFailures() === 0 && gateEvents.join() === "false,true");
+netFail(); netFail();
+check("gate: after a reset, two failures are tolerated again", getDataOnline() === true && getConsecutiveDataFailures() === 2);
+noteDataSuccess();
+unsubGate();
+
+// ------------------------------------------------------------ source statics
+const dataJs = readFileSync(join(root, "public/lib/data.mjs"), "utf8");
+check("data layer beats presence via presence_beats upsert only",
+  dataJs.includes("presence_beats?on_conflict=shell_id") && dataJs.includes("resolution=merge-duplicates"));
+check("realtime source sends phoenix heartbeat frames", dataJs.includes('topic: "phoenix", event: "heartbeat"'));
+check("realtime source reconnects on the capped backoff ladder",
+  dataJs.includes("[1000, 2000, 5000, 10000, 30000]") && dataJs.includes("scheduleReconnect"));
+check("config version is 1.0.4", readFileSync(join(root, "public/config.js"), "utf8").includes('version: "1.0.4"'));
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

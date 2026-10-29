@@ -1,4 +1,4 @@
-// Nova LiveOS boot snapshot — v1.0.3
+// Nova LiveOS boot snapshot — v1.0.4
 // The last good state, persisted to localStorage on every successful
 // refresh so the NEXT boot can paint the home screen immediately from
 // it instead of sitting on skeleton bars while the network round trips

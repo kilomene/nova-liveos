@@ -1,4 +1,4 @@
-// Nova LiveOS network helpers — v1.0.3
+// Nova LiveOS network helpers — v1.0.4
 // fetch with a hard timeout and one automatic retry. The v0.1 cold-load
 // defect was a single slow query stalling the whole shell forever; every
 // data call in v1.0 goes through here so a slow request fails visibly and
@@ -13,6 +13,17 @@
 // ------------------------------------------------------- connectivity state
 let dataOnline = true;
 const connectivityListeners = new Set();
+
+// v1.0.4 ANTI-FLAP GATE: v1.0.1 flipped the shell to "offline" on a
+// SINGLE failed round trip, so any transient stall (a slow query, a
+// dropped packet, a busy radio) showed the owner a disconnected state
+// that flipped back on the next success — the off-and-on behaviour he
+// reported. A failure now only counts toward a consecutive-failure
+// counter; the state flips offline at OFFLINE_AFTER_FAILURES in a row,
+// and ANY success resets the counter and flips back online immediately.
+let consecutiveDataFailures = 0;
+export const OFFLINE_AFTER_FAILURES = 3;
+export function getConsecutiveDataFailures() { return consecutiveDataFailures; }
 
 // A failure counts as a connectivity failure only when the request never
 // got a response: fetch() TypeErrors ("Failed to fetch" / "Load failed"),
@@ -37,12 +48,19 @@ function setDataOnline(next) {
 
 // Record a successful data-layer round trip. Any HTTP response — even a
 // 4xx/5xx — proves connectivity, so fetchWithRetry calls this whenever a
-// response arrives.
-export function noteDataSuccess() { setDataOnline(true); }
+// response arrives. A success also resets the anti-flap failure counter
+// and restores the online state immediately.
+export function noteDataSuccess() { consecutiveDataFailures = 0; setDataOnline(true); }
 
 // Record a failed data-layer round trip. Only genuine network failures
-// flip the state offline; other errors leave it untouched.
-export function noteDataFailure(err) { if (isNetworkError(err)) setDataOnline(false); }
+// count, and the state flips offline only at OFFLINE_AFTER_FAILURES
+// consecutive ones (v1.0.4 anti-flap gate); other errors leave both the
+// state and the counter untouched.
+export function noteDataFailure(err) {
+  if (!isNetworkError(err)) return;
+  consecutiveDataFailures += 1;
+  if (consecutiveDataFailures >= OFFLINE_AFTER_FAILURES) setDataOnline(false);
+}
 
 export function onDataConnectivity(fn) {
   connectivityListeners.add(fn);

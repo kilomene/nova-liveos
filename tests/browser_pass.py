@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Nova LiveOS browser QA pass — v1.0.3.
+"""Nova LiveOS browser QA pass — v1.0.4.
 Serves a copy of public/ (with a PLACEHOLDER config, so the pass always runs
 in local fixture mode) and drives headless Chromium (Playwright) through
 the v1.0 flows: home/drawer/store, kanban moves (buttons + real drag),
@@ -29,7 +29,7 @@ def check(name, cond, detail=""):
 serve_dir = Path(tempfile.mkdtemp(prefix="liveos-pass-"))
 shutil.copytree(ROOT / "public", serve_dir, dirs_exist_ok=True)
 (serve_dir / "config.js").write_text(
-    'window.LIVEOS_CONFIG = { version: "1.0.3", supabaseUrl: "", supabaseAnonKey: "" };\n')
+    'window.LIVEOS_CONFIG = { version: "1.0.4", supabaseUrl: "", supabaseAnonKey: "" };\n')
 
 server = subprocess.Popen([sys.executable, "-m", "http.server", str(PORT), "--directory", str(serve_dir)],
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -55,7 +55,7 @@ try:
         page.wait_for_selector("text=One shell. Everything else is data.", timeout=10000)
         check("home renders from fixture screens", True)
         check("home shows live status (local)", "local mode" in page.inner_text("#liveStatus"))
-        check("fresh first load shows footer version 1.0.3 immediately", "v1.0.3" in page.inner_text("#drawer"))
+        check("fresh first load shows footer version 1.0.4 immediately", "v1.0.4" in page.inner_text("#drawer"))
         check("no offline banner while data loads successfully", not page.locator("#offlineBanner.show").count())
         page.screenshot(path=str(MANIFEST / "01-home.png"))
 
