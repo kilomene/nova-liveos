@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nova LiveOS</title>
+<meta name="description" content="Nova LiveOS — the serverless Nova platform. One installable shell; every screen, feature and module lives in the database and updates live.">
+<meta name="theme-color" content="#ffffff">
+<link rel="icon" href="favicon.ico">
+<link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div id="drawerOverlay" class="drawer-overlay"></div>
+<aside id="drawer" class="drawer" aria-label="Navigation">
+  <div class="drawer-head">
+    <img class="drawer-logo" src="assets/nova-logo.jpg" alt="Nova logo">
+    <div>
+      <div class="drawer-title">Nova LiveOS</div>
+      <div class="drawer-sub">A Nova company</div>
+    </div>
+  </div>
+  <div class="drawer-status"><span id="liveDot" class="live-dot"></span><span id="liveStatus">Connecting…</span></div>
+  <nav id="drawerNav" class="drawer-nav"></nav>
+  <div class="drawer-foot">A Nova company · v0.1.0</div>
+</aside>
+
+<header class="topbar">
+  <button id="menuBtn" class="icon-btn" aria-label="Open menu">☰</button>
+  <img class="topbar-logo" src="assets/nova-logo.jpg" alt="Nova logo">
+  <div class="topbar-title">Nova LiveOS</div>
+  <span id="modePill" class="mode-pill">local</span>
+  <button id="simulateBtn" class="btn btn-ghost simulate-btn" title="Change a screen definition in the data layer and watch the shell update in place">Simulate live change</button>
+</header>
+
+<main id="app" class="app"><p class="loading">Loading…</p></main>
+<div id="toast" class="toast" role="status"></div>
+
+<script src="config.js"></script>
+<script type="module" src="app.js"></script>
+</body>
+</html>
