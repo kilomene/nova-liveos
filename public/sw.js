@@ -1,4 +1,4 @@
-// Nova LiveOS service worker — v1.0.2
+// Nova LiveOS service worker — v1.0.3
 // Caches the static shell only. All data (modules, screens, records) is
 // fetched live from the data layer and is never baked into the cache.
 //
@@ -24,12 +24,13 @@
 // hop: old page → (SW update) → this activate → navigate → new shell.
 // Shells that DO have the guard (v1.0.1+) are doubly covered and the
 // in-app guard simply never needs to fire for this hop.
-const CACHE = "liveos-shell-1.0.2";
+const CACHE = "liveos-shell-1.0.3";
 const SHELL = [
   "./", "./index.html", "./styles.css", "./app.js", "./config.js",
   "./manifest.webmanifest", "./favicon.ico",
   "./lib/core.mjs", "./lib/data.mjs", "./lib/seed-data.mjs",
   "./lib/icons.mjs", "./lib/features.mjs", "./lib/auth.mjs", "./lib/net.mjs",
+  "./lib/snapshot.mjs", "./lib/refresh.mjs", "./lib/patch.mjs",
   "./assets/nova-logo.jpg", "./assets/icon-192.png", "./assets/icon-512.png",
   "./assets/apple-touch-icon.png", "./assets/favicon-32.png"
 ];

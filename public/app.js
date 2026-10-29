@@ -1,4 +1,4 @@
-// Nova LiveOS shell — v1.0.2 "Advanced"
+// Nova LiveOS shell — v1.0.3 "Advanced"
 // Ships empty: navigation, pages and features all come from the data layer
 // (Supabase when configured, local fixture data otherwise) and re-render
 // live when the data changes — no reload, no redeploy.
@@ -9,6 +9,18 @@
 // palette, notifications, presence, the in-shell automation engine, and
 // optimistic updates on every mutation (instant local echo, then server
 // confirmation; a failure rolls back via a fresh read + a visible toast).
+//
+// v1.0.3: first-paint speed + monotonic state + invisible sync. Boot
+// paints the last good state from the localStorage snapshot
+// (lib/snapshot) instantly and revalidates in the background; cold
+// boots paint each data class as it lands. Refresh cycles are
+// coordinated (lib/refresh): concurrently started, sequence-gated, and
+// — once a complete state exists — applied all-or-nothing, so a
+// partial, failed or stale cycle can never downgrade the rendered
+// state or its counts. And refresh is invisible: presence never
+// reaches the render path, a no-change cycle does zero DOM work, and
+// real changes are patched into the live DOM in place (lib/patch) —
+// scroll, focus and typed input survive every sync.
 
 import { renderBlock, renderScreen, escapeHtml, fillTemplate } from "./lib/core.mjs";
 import { createAdapter, PRESENCE_WINDOW_MS } from "./lib/data.mjs";
@@ -21,6 +33,9 @@ import {
 import { runAutomations } from "./lib/features.mjs";
 import { displayNameFromEmail } from "./lib/auth.mjs";
 import { getDataOnline, noteDataSuccess, noteDataFailure, onDataConnectivity } from "./lib/net.mjs";
+import { snapshotIdentity, readSnapshot, writeSnapshot } from "./lib/snapshot.mjs";
+import { settle, createCycleTracker, buildCandidate, dataStatesEqual } from "./lib/refresh.mjs";
+import { patchChildren } from "./lib/patch.mjs";
 
 const config = window.LIVEOS_CONFIG || {};
 const adapter = createAdapter(config);
@@ -36,7 +51,7 @@ let state = {
   modules: [], screens: [], records: [], installs: [],
   automations: [], audit: [], profile: null, roles: [],
   session: null, presence: 1, catalogue: null, booted: false, coreReady: false,
-  recordsReady: false
+  recordsReady: false, fromSnapshot: false
 };
 let cart = loadCart();
 let sortState = {};
@@ -121,8 +136,17 @@ function route() {
 }
 
 // -------------------------------------------------------------------- chrome
+// The drawer is rebuilt only when its signature actually changes
+// (route, installs, module identities, session, unread, cart) — a
+// background refresh that changes none of those leaves the DOM alone.
+let lastNavSig = "";
 function renderNav() {
   const r = route();
+  const sig = JSON.stringify([r.view, r.slug || "", state.installs,
+    state.modules.map((m) => `${m.slug}:${m.name}:${moduleIconSlug(m)}:${m.manifest?.category || ""}`),
+    state.session?.user?.email || "", isAdmin(), unreadCount(), cart.count]);
+  if (sig === lastNavSig) return;
+  lastNavSig = sig;
   const groups = new Map();
   for (const slug of state.installs) {
     const mod = state.modules.find((m) => m.slug === slug);
@@ -170,19 +194,35 @@ function unreadCount() {
   return notificationsFrom({ records: state.records, audit: state.audit }, seen, 99).length;
 }
 
+// Badge + presence writes are value-gated: the DOM is touched only
+// when the displayed number actually changes. A presence heartbeat
+// whose count is unchanged writes nothing at all.
+const badgeCache = { bell: null, cart: null, presence: null };
 function updateBadges() {
   const bellBadge = document.getElementById("bellBadge");
   const cartBadge = document.getElementById("cartBadge");
   const n = unreadCount();
-  if (bellBadge) { bellBadge.textContent = n; bellBadge.style.display = n ? "inline-flex" : "none"; }
-  if (cartBadge) { cartBadge.textContent = cart.count; cartBadge.style.display = cart.count ? "inline-flex" : "none"; }
+  if (bellBadge && badgeCache.bell !== n) {
+    badgeCache.bell = n;
+    bellBadge.textContent = n;
+    bellBadge.style.display = n ? "inline-flex" : "none";
+  }
+  if (cartBadge && badgeCache.cart !== cart.count) {
+    badgeCache.cart = cart.count;
+    cartBadge.textContent = cart.count;
+    cartBadge.style.display = cart.count ? "inline-flex" : "none";
+  }
   const presenceEl = document.getElementById("presenceChip");
-  if (presenceEl) presenceEl.innerHTML = `<span class="presence-dot"></span>${state.presence} online`;
+  if (presenceEl && badgeCache.presence !== state.presence) {
+    badgeCache.presence = state.presence;
+    presenceEl.innerHTML = `<span class="presence-dot"></span>${state.presence} online`;
+  }
 }
 
 function renderChromeStatus() {
   document.getElementById("liveStatus").textContent = !state.coreReady
     ? "Connecting…"
+    : state.fromSnapshot ? "Syncing…"
     : adapter.mode === "supabase" ? "Live · Supabase connected" : "Live · local mode (fixture data)";
   document.getElementById("modePill").textContent = adapter.mode;
   updateBadges();
@@ -459,7 +499,19 @@ function adminAutomationsView() {
 }
 
 // -------------------------------------------------------------------- render
-function render() {
+const boundEls = new WeakSet();
+function bindOnce(el, event, fn) {
+  if (el && !boundEls.has(el)) { boundEls.add(el); el.addEventListener(event, fn); }
+}
+
+// Rendering patches the live DOM in place (lib/patch) instead of
+// replacing innerHTML: unchanged subtrees are never touched, so scroll,
+// focus, caret, typed input and drag state survive, and a data change
+// lands as an in-place update — never a screen blink. `background`
+// renders (data refreshes, as opposed to navigations / user actions)
+// additionally skip the view-enter animation and the counter count-up.
+function render(opts = {}) {
+  const background = !!opts.background;
   const r = route();
   let html;
   if (r.view === "home") html = homeView();
@@ -476,19 +528,21 @@ function render() {
       : r.section === "automations" ? adminAutomationsView()
       : adminHomeView();
   } else html = moduleView(r.slug);
-  app.innerHTML = html;
-  app.classList.remove("view-enter");
-  void app.offsetWidth;
-  app.classList.add("view-enter");
+  const tpl = document.createElement("template");
+  tpl.innerHTML = html;
+  patchChildren(app, tpl.content);
+  if (!background) {
+    app.classList.remove("view-enter");
+    void app.offsetWidth;
+    app.classList.add("view-enter");
+  }
   renderNav();
   renderChromeStatus();
-  const sim2 = document.getElementById("simulateBtn2");
-  if (sim2) sim2.addEventListener("click", simulateLiveChange);
-  const signOut = document.getElementById("signOutBtn");
-  if (signOut) signOut.addEventListener("click", doSignOut);
+  bindOnce(document.getElementById("simulateBtn2"), "click", simulateLiveChange);
+  bindOnce(document.getElementById("signOutBtn"), "click", doSignOut);
   const pwa = document.getElementById("pwaInstallBtn");
-  if (pwa && deferredInstallPrompt) pwa.addEventListener("click", promptInstall);
-  animateCounters();
+  if (pwa && deferredInstallPrompt) bindOnce(pwa, "click", promptInstall);
+  if (!background) animateCounters();
   if (r.view === "notifications") {
     localStorage.setItem(SEEN_KEY, String(Date.now()));
     setTimeout(updateBadges, 400);
@@ -521,67 +575,169 @@ async function loadAuthState() {
   } catch { state.session = null; state.profile = null; state.roles = []; }
 }
 
-async function refresh(reason) {
-  try {
-    const [core, records, automations, audit] = await Promise.all([
-      adapter.getCoreState(),
-      adapter.getRecords ? adapter.getRecords() : adapter.getState().then((s) => s.records),
-      adapter.getAutomations ? adapter.getAutomations().catch(() => state.automations) : Promise.resolve(state.automations),
-      adapter.getAudit ? adapter.getAudit(100).catch(() => state.audit) : Promise.resolve(state.audit)
-    ]);
-    state.modules = core.modules;
-    state.screens = core.screens;
-    state.installs = core.installs;
-    state.records = records;
-    state.automations = automations;
-    state.audit = audit;
-    state.coreReady = true;
-    state.recordsReady = true;
-    noteDataSuccess();
-    updateOnlineBanner();
-    if (route().view === "admin" && isAdmin() && adapter.getAdminCatalogue) {
-      try { state.catalogue = await adapter.getAdminCatalogue(); } catch { /* keep previous */ }
-    }
-    render();
-    if (reason) console.debug("[liveos] re-render:", reason);
-  } catch (err) {
-    console.error("[liveos] load failed:", err);
-    noteDataFailure(err);
-    updateOnlineBanner();
+// ---------------------------------------------------------- boot snapshot
+// The last good state, persisted by every successful refresh, lets boot
+// paint the home screen immediately and revalidate in the background
+// (v1.0.3). Identity-bound (mode + project origin + user id): a snapshot
+// is only ever painted for the exact shell identity that wrote it.
+const refreshGate = createCycleTracker();
+function snapshotIdentityFor() {
+  return snapshotIdentity({ mode: adapter.mode, supabaseUrl: config.supabaseUrl || "", userId: adapter.userId });
+}
+function persistSnapshot() {
+  writeSnapshot(localStorage, state, snapshotIdentityFor());
+}
+function hydrateFromSnapshot() {
+  const snap = readSnapshot(localStorage, snapshotIdentityFor());
+  if (!snap) return false;
+  state.modules = snap.modules;
+  state.screens = snap.screens;
+  state.installs = snap.installs;
+  state.records = snap.records;
+  state.coreReady = true;
+  // When the snapshot's records had to be trimmed to fit, keep the stats
+  // in their pending state until the live records land.
+  state.recordsReady = snap.recordsComplete;
+  state.fromSnapshot = true;
+  return true;
+}
+
+function loadFailure(err) {
+  console.error("[liveos] load failed:", err);
+  noteDataFailure(err);
+  updateOnlineBanner();
+  // The error page replaces the view ONLY when nothing is painted: with
+  // a snapshot (or any earlier good state) on screen, a failed load keeps
+  // that state visible and the connectivity banner carries the news.
+  if (!state.coreReady) {
     app.innerHTML = `<section class="block"><h1>Couldn't load LiveOS data</h1><p>${escapeHtml(err?.message || String(err))}</p><p><button class="btn btn-primary" id="retryBtn">Retry</button></p></section>`;
     document.getElementById("retryBtn")?.addEventListener("click", () => boot());
+  }
+  return false;
+}
+
+async function refreshCatalogue() {
+  if (route().view === "admin" && isAdmin() && adapter.getAdminCatalogue) {
+    try { state.catalogue = await adapter.getAdminCatalogue(); } catch { /* keep previous */ }
   }
 }
 
-// Progressive boot: catalogue first (home + store render immediately),
-// records right behind it, auth/presence in parallel. Nothing waits on the
-// slowest query, and every call is timeout-guarded in the adapter.
-async function boot() {
-  try {
-    const core = await adapter.getCoreState();
-    state.modules = core.modules;
-    state.screens = core.screens;
-    state.installs = core.installs;
-    // The local adapter's core state already carries the records; adopt
-    // them so the first paint shows real stats. The Supabase core state
-    // has none — recordsReady stays false and stats render as skeletons
-    // until refresh() lands the first live records load.
-    if (Array.isArray(core.records)) {
-      state.records = core.records;
-      state.recordsReady = true;
-    }
+// Presence heartbeat mirrors (the audit trigger copies every heartbeat
+// insert into the audit log) are stripped from the state's audit list:
+// they are not activity, and letting them in would make every heartbeat
+// look like a state change. Display layers filter them too; this keeps
+// the no-change gate exact.
+function cleanAudit(list) {
+  return (list || []).filter((a) => !isPresenceAudit(a));
+}
+
+// Refresh, coordinated (v1.0.3):
+// - Every fetch starts concurrently; nothing waits in a queue behind a
+//   slower, less important query.
+// - While the shell holds NO complete state (cold boot, or a snapshot
+//   whose records have not revalidated), each class of data paints the
+//   moment it lands: catalogue first, records next, automations/audit
+//   last. The first paint never waits on the slowest query.
+// - Once a complete state exists, replacement is MONOTONIC: the whole
+//   candidate is built first and swapped in only if the full fetch set
+//   succeeded AND this cycle is still the newest. A partial, failed or
+//   stale cycle leaves the last good state — and its counts — untouched.
+async function refresh(reason) {
+  const seq = refreshGate.begin();
+  const wasPainted = state.coreReady;
+  const hasGoodState = state.coreReady && state.recordsReady;
+  const parts = {
+    core: settle(adapter.getCoreState()),
+    records: settle(adapter.getRecords ? adapter.getRecords() : adapter.getState().then((s) => s.records)),
+    automations: settle(adapter.getAutomations ? adapter.getAutomations() : Promise.resolve(state.automations)),
+    audit: settle(adapter.getAudit ? adapter.getAudit(100) : Promise.resolve(state.audit))
+  };
+
+  if (!hasGoodState) {
+    const core = await parts.core;
+    if (!refreshGate.canCommit(seq)) return state.coreReady;
+    if (!core.ok) return loadFailure(core.error);
+    state.modules = core.value.modules;
+    state.screens = core.value.screens;
+    state.installs = core.value.installs;
     state.coreReady = true;
     noteDataSuccess();
-    render();
-  } catch (err) {
-    console.error("[liveos] core load failed:", err);
-    noteDataFailure(err);
     updateOnlineBanner();
-    app.innerHTML = `<section class="block"><h1>Couldn't load LiveOS data</h1><p>${escapeHtml(err?.message || String(err))}</p><p><button class="btn btn-primary" id="retryBtn">Retry</button></p></section>`;
-    document.getElementById("retryBtn")?.addEventListener("click", () => boot());
-    return;
+    render({ background: wasPainted });
+    const rec = await parts.records;
+    if (!refreshGate.canCommit(seq)) return true;
+    if (rec.ok) {
+      state.records = rec.value;
+      state.recordsReady = true;
+    } else {
+      noteDataFailure(rec.error);
+      updateOnlineBanner();
+    }
+    render({ background: true });
+    const [au, ad] = await Promise.all([parts.automations, parts.audit]);
+    if (!refreshGate.canCommit(seq)) return true;
+    if (au.ok) state.automations = au.value;
+    if (ad.ok) state.audit = cleanAudit(ad.value);
+    if (rec.ok) {
+      state.fromSnapshot = false;
+      refreshGate.markApplied(seq);
+      persistSnapshot();
+      await refreshCatalogue();
+    }
+    render({ background: true });
+    if (reason) console.debug("[liveos] re-render:", reason);
+    return true;
   }
-  await refresh("boot-records");
+
+  const candidate = buildCandidate({
+    core: await parts.core,
+    records: await parts.records,
+    automations: await parts.automations,
+    audit: await parts.audit
+  }, state);
+  if (!candidate.complete) {
+    // Partial or failed cycle: keep the last good state exactly as-is.
+    noteDataFailure(candidate.error);
+    updateOnlineBanner();
+    console.error("[liveos] refresh kept last good state:", candidate.error);
+    return true;
+  }
+  if (!refreshGate.canCommit(seq)) return true; // a newer cycle owns the state now
+  candidate.state.audit = cleanAudit(candidate.state.audit);
+  if (dataStatesEqual(candidate.state, state)) {
+    // No-change cycle: the fetches succeeded, but nothing on screen may
+    // move — no render, no DOM writes, no snapshot rewrite. (The admin
+    // catalogue is the one exception: it can change without any of the
+    // six gated classes changing, so it still refreshes in admin view.)
+    noteDataSuccess();
+    updateOnlineBanner();
+    const prevCatalogue = state.catalogue;
+    await refreshCatalogue();
+    if (state.catalogue !== prevCatalogue) render({ background: true });
+    return true;
+  }
+  state.modules = candidate.state.modules;
+  state.screens = candidate.state.screens;
+  state.installs = candidate.state.installs;
+  state.records = candidate.state.records;
+  state.automations = candidate.state.automations;
+  state.audit = candidate.state.audit;
+  state.fromSnapshot = false;
+  refreshGate.markApplied(seq);
+  noteDataSuccess();
+  updateOnlineBanner();
+  persistSnapshot();
+  await refreshCatalogue();
+  render({ background: true });
+  if (reason) console.debug("[liveos] re-render:", reason);
+  return true;
+}
+
+// Boot: the init code below has already painted any snapshot, so boot is
+// just the first (revalidating) refresh, then auth + presence alongside.
+async function boot() {
+  const ok = await refresh("boot");
+  if (!ok && !state.coreReady) return; // nothing painted: the error page is up
   loadAuthState().then(() => render());
   startPresence();
 }
@@ -776,11 +932,13 @@ async function doSignOut() {
   state.session = null; state.profile = null; state.roles = [];
   toast("Signed out. This shell is anonymous again.");
   await refresh("signout");
+  render(); // session is not a refresh data class — reflect it explicitly
 }
 
 async function afterAuthChange() {
   await loadAuthState();
   await refresh("auth");
+  render(); // session/profile/roles are not refresh data classes — reflect them explicitly
   toast(state.session ? `Signed in as ${displayName()}.` : "Signed out.");
 }
 
@@ -1202,6 +1360,10 @@ if (adapter.mode === "supabase" && adapter.auth) {
   }
 }
 if (!localStorage.getItem(SEEN_KEY)) localStorage.setItem(SEEN_KEY, String(Date.now()));
+// Paint the last good state from the boot snapshot, if one exists for
+// this identity — the first render below is then real home content, and
+// boot() only has to revalidate it in the background.
+hydrateFromSnapshot();
 updateOnlineBanner();
 render();
 adapter.onChange(() => refresh("change-event"));

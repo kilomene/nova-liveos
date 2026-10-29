@@ -1,4 +1,4 @@
-// Nova LiveOS data layer — v1.0.2
+// Nova LiveOS data layer — v1.0.3
 // Two adapters behind one interface:
 //   LocalAdapter    — fixture data in localStorage (works offline, no account)
 //   SupabaseAdapter — PostgREST via fetch with the anon key (or the signed-in
@@ -40,6 +40,24 @@ export function newUuid() {
 
 export const PRESENCE_MODULE = "liveos-core";
 export const PRESENCE_WINDOW_MS = 45_000;
+
+// True when a Realtime websocket message carries ONLY presence churn:
+// a heartbeat insert into records (module_slug = liveos-core) or the
+// audit trigger's mirror of one. Presence must never trigger a render —
+// the shell filters these messages out of the change path entirely, so
+// the only effect a heartbeat can have is the presence chip updating
+// its own text (lib/../app startPresence). Unparseable or unfamiliar
+// payloads are NOT presence (safe default: treat as a real change).
+export function isPresenceChangePayload(text) {
+  let msg;
+  try { msg = JSON.parse(String(text)); } catch { return false; }
+  const d = msg?.payload?.data;
+  if (!d || typeof d !== "object") return false;
+  if (d.table === "records" && d.record?.module_slug === PRESENCE_MODULE) return true;
+  if (d.table === "audit_log" && d.record?.event === "insert.records" &&
+      d.record?.detail?.module_slug === PRESENCE_MODULE) return true;
+  return false;
+}
 
 // ------------------------------------------------------------ local store
 // Pure state logic over a {getItem,setItem} storage — unit-testable in node
@@ -614,7 +632,13 @@ export class SupabaseAdapter {
             ] } }, ref: "1"
         }));
       };
-      this._ws.onmessage = (msg) => { if (!stopped && String(msg.data).includes("postgres_changes")) fn({ type: "realtime" }); };
+      this._ws.onmessage = (msg) => {
+        if (stopped) return;
+        const text = String(msg.data);
+        if (!text.includes("postgres_changes")) return;
+        if (isPresenceChangePayload(text)) return; // heartbeats never render
+        fn({ type: "realtime" });
+      };
     } catch { /* polling fallback covers it */ }
     return () => { stopped = true; clearInterval(this._timer); try { this._ws?.close(); } catch {} };
   }

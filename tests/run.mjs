@@ -1,14 +1,16 @@
-// Nova LiveOS test suite — v1.0.2. Zero dependencies: `node tests/run.mjs`.
+// Nova LiveOS test suite — v1.0.3. Zero dependencies: `node tests/run.mjs`.
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { renderBlock, renderScreen, fillTemplate, escapeHtml, renderMarkdown, aggregateRecords, kanbanColumns, sortRows } from "../public/lib/core.mjs";
-import { createLocalStore, selectMode, SupabaseAdapter, isUuid } from "../public/lib/data.mjs";
+import { createLocalStore, selectMode, SupabaseAdapter, isUuid, isPresenceChangePayload } from "../public/lib/data.mjs";
 import { SEED } from "../public/lib/seed-data.mjs";
 import { ICONS, ICON_SLUGS, isIconSlug, iconSvg, moduleIconSlug, moduleIcon } from "../public/lib/icons.mjs";
 import { cartAdd, cartSetQty, cartRemove, cartView, cartSummary, moveRecordStatus, buildSearchIndex, searchIndex, notificationsFrom, isPresenceRecord, isPresenceAudit, BLOCK_SCHEMAS, BLOCK_TYPES, addBlock, removeBlock, moveBlockInLayout, applyBlockEdit, runAutomations, automationMatches } from "../public/lib/features.mjs";
 import { fetchWithRetry, isNetworkError, noteDataSuccess, noteDataFailure, getDataOnline, onDataConnectivity } from "../public/lib/net.mjs";
 import { sessionFromAuthResponse, parseStoredSession, isSessionExpired, displayNameFromEmail, AuthClient } from "../public/lib/auth.mjs";
+import { SNAPSHOT_KEY, SNAPSHOT_VERSION, MAX_SNAPSHOT_AGE_MS, snapshotIdentity, buildSnapshot, parseSnapshot, readSnapshot, writeSnapshot } from "../public/lib/snapshot.mjs";
+import { settle, createCycleTracker, buildCandidate, dataStatesEqual } from "../public/lib/refresh.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 let passed = 0, failed = 0;
@@ -340,8 +342,8 @@ check("migration 0003 widens records update/delete to null-created rows", mig3.i
 check("migration 0003 seeds the engine automations", mig3.includes("order-activity") && mig3.includes("bid-activity") && mig3.includes("job-audit"));
 check("migration 0003 has no service-role key", !/service_role|SERVICE_ROLE/.test(mig3));
 const swJs = readFileSync(join(root, "public/sw.js"), "utf8");
-check("service worker cache is liveos-shell-1.0.2", swJs.includes('liveos-shell-1.0.2'));
-check("service worker caches the new lib modules", swJs.includes("icons.mjs") && swJs.includes("features.mjs") && swJs.includes("auth.mjs") && swJs.includes("net.mjs"));
+check("service worker cache is liveos-shell-1.0.3", swJs.includes('liveos-shell-1.0.3'));
+check("service worker caches the new lib modules", swJs.includes("icons.mjs") && swJs.includes("features.mjs") && swJs.includes("auth.mjs") && swJs.includes("net.mjs") && swJs.includes("snapshot.mjs") && swJs.includes("refresh.mjs") && swJs.includes("patch.mjs"));
 // v1.0.1 defect 1: the fetch handler must be network-first — the network
 // fetch must appear before any cache lookup in the handler, and the cache
 // may only be consulted inside the fetch failure path.
@@ -350,9 +352,9 @@ check("service worker fetch handler is network-first", fetchHandler.indexOf("fet
 check("service worker still bypasses cross-origin/non-GET", fetchHandler.includes('url.origin !== location.origin') && fetchHandler.includes('e.request.method !== "GET"'));
 const appJs = readFileSync(join(root, "public/app.js"), "utf8");
 check("app registers a controllerchange auto-reload guard", appJs.includes("controllerchange") && appJs.includes("liveos.swReloaded") && appJs.includes("sessionStorage"));
-check("app version header is v1.0.2", appJs.includes("Nova LiveOS shell — v1.0.2"));
+check("app version header is v1.0.3", appJs.includes("Nova LiveOS shell — v1.0.3"));
 const indexHtml = readFileSync(join(root, "public/index.html"), "utf8");
-check("index footer says v1.0.2", indexHtml.includes("A Nova company · v1.0.2"));
+check("index footer says v1.0.3", indexHtml.includes("A Nova company · v1.0.3"));
 check("index has palette + account + badges mounts", indexHtml.includes('id="palette"') && indexHtml.includes('id="drawerAccount"') && indexHtml.includes('id="bellBadge"'));
 
 // ============================================================ v1.0.1 sections
@@ -419,7 +421,7 @@ check("day line chart first point is padded from the edge (no label clipping)", 
 // never loads the new app.js, so the escape must live in sw.js itself —
 // the browser's SW update check is the one delivery that bypasses the
 // old worker). Static assertions on the worker's source.
-check("sw header is v1.0.2", swJs.includes("service worker — v1.0.2"));
+check("sw header is v1.0.3", swJs.includes("service worker — v1.0.3"));
 check("sw self-rescue collects window clients on activate", swJs.includes("clients.matchAll") && swJs.includes('type: "window"') && swJs.includes("includeUncontrolled"));
 check("sw self-rescue force-navigates clients onto the new shell", swJs.includes("client.navigate(client.url)"));
 check("sw self-rescue is gated on replacing a different version (stale caches existed)",
@@ -431,6 +433,113 @@ check("sw self-rescue feature-checks navigate and guards same-origin",
   swJs.includes('typeof client.navigate !== "function"') && swJs.includes("new URL(client.url).origin !== self.location.origin"));
 check("sw self-rescue fires navigate DETACHED (awaiting it inside activate deadlocks Chromium)",
   !swJs.includes("await client.navigate") && swJs.includes("setTimeout"));
+
+// ============================================================ v1.0.3 sections
+// ------------------------------------------------- boot snapshot (first paint)
+const snapStorage = memoryStorage();
+const snapId = snapshotIdentity({ mode: "supabase", supabaseUrl: "https://abcd1234.supabase.co/", userId: "user-1" });
+check("snapshot identity normalises the project origin", snapId.origin === "https://abcd1234.supabase.co" && snapId.mode === "supabase");
+const snapData = {
+  modules: SEED.modules, screens: SEED.screens, installs: ["team-board", "chat"],
+  records: [{ id: "r1", module_slug: "chat", kind: "message", payload: { text: "hi" }, created_at: new Date().toISOString() }]
+};
+check("snapshot write succeeds", writeSnapshot(snapStorage, snapData, snapId) === true);
+const snapBack = readSnapshot(snapStorage, snapId);
+check("snapshot round-trips modules/screens/installs/records",
+  !!snapBack && snapBack.modules.length === 6 && snapBack.screens.length === SEED.screens.length &&
+  snapBack.installs.length === 2 && snapBack.records.length === 1 && snapBack.recordsComplete === true);
+check("snapshot is hidden from a different user",
+  readSnapshot(snapStorage, snapshotIdentity({ mode: "supabase", supabaseUrl: "https://abcd1234.supabase.co", userId: "user-2" })) === null);
+check("snapshot is hidden from a different project",
+  readSnapshot(snapStorage, snapshotIdentity({ mode: "supabase", supabaseUrl: "https://other9999.supabase.co", userId: "user-1" })) === null);
+check("snapshot is hidden when the config drops to local/placeholder mode",
+  readSnapshot(snapStorage, snapshotIdentity({ mode: "local", supabaseUrl: "", userId: "user-1" })) === null);
+snapStorage.setItem(SNAPSHOT_KEY, "{not json");
+check("a corrupt snapshot reads as no snapshot", readSnapshot(snapStorage, snapId) === null);
+snapStorage.setItem(SNAPSHOT_KEY, JSON.stringify({ v: 99, savedAt: Date.now(), identity: snapId, modules: [], screens: [], installs: [], records: [] }));
+check("an unknown snapshot version is ignored", readSnapshot(snapStorage, snapId) === null);
+snapStorage.setItem(SNAPSHOT_KEY, JSON.stringify({ v: SNAPSHOT_VERSION, savedAt: Date.now(), identity: snapId, modules: "nope", screens: [], installs: [], records: [] }));
+check("a malformed snapshot shape is ignored", readSnapshot(snapStorage, snapId) === null);
+const oldSnap = buildSnapshot(snapData, snapId, Date.now() - MAX_SNAPSHOT_AGE_MS - 1000);
+check("a snapshot past the age cap is ignored", parseSnapshot(JSON.stringify(oldSnap), snapId) === null);
+const freshSnap = buildSnapshot(snapData, snapId, Date.now() - 1000);
+check("a fresh snapshot parses with its records", parseSnapshot(JSON.stringify(freshSnap), snapId)?.records.length === 1);
+const bigRecs = Array.from({ length: 40 }, (_, i) => ({
+  id: `big-${i}`, module_slug: "chat", kind: "message",
+  payload: { text: "x".repeat(60000), n: i }, created_at: new Date(Date.now() + i * 1000).toISOString()
+}));
+const bigStorage = memoryStorage();
+check("an oversized snapshot write still succeeds via trimming", writeSnapshot(bigStorage, { ...snapData, records: bigRecs }, snapId) === true);
+const bigBack = readSnapshot(bigStorage, snapId);
+check("trimming keeps the newest records and flags the snapshot records-incomplete",
+  !!bigBack && bigBack.recordsComplete === false && bigBack.records.length < 40 &&
+  bigBack.records[bigBack.records.length - 1].id === "big-39");
+const throwingStorage = { getItem: () => null, setItem: () => { throw new Error("quota"); } };
+check("a throwing store makes the snapshot write a silent no-op", writeSnapshot(throwingStorage, snapData, snapId) === false);
+check("the snapshot lives under its versioned key", SNAPSHOT_KEY === "liveos.snapshot.v1");
+
+// --------------------------------------- refresh coordination (monotonic state)
+const gate = createCycleTracker();
+const cyc1 = gate.begin();
+check("the newest refresh cycle may commit", gate.canCommit(cyc1));
+const cyc2 = gate.begin();
+check("an older in-flight cycle may no longer commit once a newer one begins", !gate.canCommit(cyc1) && gate.canCommit(cyc2));
+gate.markApplied(cyc2);
+check("a committed cycle blocks every older cycle from landing late", !gate.canCommit(cyc1) && gate.appliedSeq === cyc2);
+const okPart = (value) => ({ ok: true, value });
+const errPart = (msg) => ({ ok: false, error: new Error(msg) });
+const prevState = { modules: ["m-old"], screens: [], installs: [], records: [{ id: "old" }], automations: ["a-old"], audit: ["u-old"] };
+const coreOk = okPart({ modules: ["m1"], screens: ["s1"], installs: ["i1"] });
+const fullCand = buildCandidate({ core: coreOk, records: okPart([{ id: "r1" }]), automations: okPart(["a1"]), audit: okPart(["u1"]) }, prevState);
+check("a complete fetch set builds a complete candidate", fullCand.complete && fullCand.state.modules[0] === "m1" && fullCand.state.records[0].id === "r1");
+const recFail = buildCandidate({ core: coreOk, records: errPart("records down"), automations: okPart(["a1"]), audit: okPart(["u1"]) }, prevState);
+check("PARTIAL REFRESH: a failed records fetch makes the candidate incomplete — nothing may be applied",
+  !recFail.complete && recFail.state === null && /records down/.test(recFail.error.message));
+const coreFail = buildCandidate({ core: errPart("core down"), records: okPart([]), automations: okPart([]), audit: okPart([]) }, prevState);
+check("PARTIAL REFRESH: a failed core fetch makes the candidate incomplete", !coreFail.complete && coreFail.state === null);
+const secFail = buildCandidate({ core: coreOk, records: okPart([{ id: "r2" }]), automations: errPart("auto down"), audit: errPart("audit down") }, prevState);
+check("secondary failures fall back to the last good automations/audit inside a complete candidate",
+  secFail.complete && secFail.state.automations[0] === "a-old" && secFail.state.audit[0] === "u-old" && secFail.state.records[0].id === "r2");
+const settledOk = await settle(Promise.resolve(7));
+const settledErr = await settle(Promise.reject(new Error("nope")));
+check("settle wraps resolve and reject uniformly", settledOk.ok && settledOk.value === 7 && !settledErr.ok && settledErr.error.message === "nope");
+check("app hydrates the boot snapshot in the init sequence before the first render",
+  appJs.includes("hydrateFromSnapshot();\nupdateOnlineBanner();"));
+check("app persists the snapshot after applied refreshes", appJs.includes("persistSnapshot()") && appJs.includes("writeSnapshot(localStorage, state, snapshotIdentityFor())"));
+check("app refresh is sequence-gated and candidate-based",
+  appJs.includes("createCycleTracker") && appJs.includes("buildCandidate") && appJs.includes("refreshGate.canCommit(seq)"));
+check("a snapshot paint is marked as syncing until revalidation lands",
+  appJs.includes("state.fromSnapshot ? \"Syncing…\""));
+
+// --------------------------------------- invisible sync (no-blink refresh)
+check("dataStatesEqual matches identical states", dataStatesEqual(prevState, { ...prevState }));
+check("dataStatesEqual spots a records change", !dataStatesEqual(prevState, { ...prevState, records: [{ id: "other" }] }));
+check("dataStatesEqual spots an installs change", !dataStatesEqual(prevState, { ...prevState, installs: ["team-board"] }));
+const presenceMirror = { event: "insert.records", entity: "records", entity_id: "p1", detail: { module_slug: "liveos-core" }, created_at: nNow };
+const churnCand = buildCandidate({
+  core: okPart({ modules: prevState.modules, screens: prevState.screens, installs: prevState.installs }),
+  records: okPart(prevState.records), automations: okPart(prevState.automations),
+  audit: okPart([presenceMirror, ...prevState.audit])
+}, prevState);
+const churnClean = { ...churnCand.state, audit: churnCand.state.audit.filter((a) => !isPresenceAudit(a)) };
+check("presence-only audit churn gates to a NO-CHANGE cycle once mirrors are cleaned",
+  churnCand.complete && dataStatesEqual(churnClean, prevState));
+const wsPresence = JSON.stringify({ event: "postgres_changes", payload: { data: { table: "records", type: "INSERT", record: { module_slug: "liveos-core", kind: "presence" } } } });
+check("a realtime presence heartbeat payload is filtered from the render path", isPresenceChangePayload(wsPresence));
+const wsMirror = JSON.stringify({ event: "postgres_changes", payload: { data: { table: "audit_log", type: "INSERT", record: { event: "insert.records", detail: { module_slug: "liveos-core" } } } } });
+check("a realtime presence audit-mirror payload is filtered from the render path", isPresenceChangePayload(wsMirror));
+const wsChat = JSON.stringify({ event: "postgres_changes", payload: { data: { table: "records", type: "INSERT", record: { module_slug: "chat", kind: "message" } } } });
+check("a real record change is NOT filtered as presence", !isPresenceChangePayload(wsChat));
+check("unparseable realtime payloads are not filtered (safe default)",
+  !isPresenceChangePayload("not json") && !isPresenceChangePayload("{}"));
+check("app patches the DOM in place instead of replacing innerHTML",
+  appJs.includes("patchChildren(app, tpl.content)") && !appJs.includes("app.innerHTML = html"));
+check("app background-renders refresh results and gates no-change cycles",
+  appJs.includes("render({ background: true })") && appJs.includes("dataStatesEqual(candidate.state, state)") && appJs.includes("cleanAudit"));
+check("app gates badge + nav writes behind value signatures",
+  appJs.includes("badgeCache.presence") && appJs.includes("lastNavSig"));
+check("auth transitions render explicitly (session is not a refresh data class, so the gate must not swallow it)",
+  appJs.includes('await refresh("auth");\n  render();') && appJs.includes('await refresh("signout");\n  render();'));
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

@@ -1,4 +1,4 @@
-// Nova LiveOS block renderer — v1.0.2
+// Nova LiveOS block renderer — v1.0.3
 // Pure functions: layout JSON in, HTML string out. No DOM access, so the same
 // code runs in the browser shell and in the node test suite.
 // v1.0 adds: kanban, table (sortable), gallery, chart (hand-rolled SVG),
