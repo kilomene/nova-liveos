@@ -54,16 +54,18 @@
 create or replace function public.liveos_audit_change()
 returns trigger language plpgsql as $$
 declare
+  j jsonb;
   row_id text;
   mod text;
 begin
-  if TG_OP = 'DELETE' then
-    row_id := coalesce(old.id::text, old.slug, '');
-    mod := coalesce(old.module_slug, '');
-  else
-    row_id := coalesce(new.id::text, new.slug, '');
-    mod := coalesce(new.module_slug, '');
-  end if;
+  -- Field access via jsonb ONLY: direct NEW.slug / NEW.module_slug
+  -- references raise 'record "new" has no field' on tables lacking those
+  -- columns (records, module_installs, modules, automations). to_jsonb
+  -- returns NULL for absent keys instead. (Fixed 2026-10-29; the original
+  -- version broke every write on those tables — see 0004.)
+  if TG_OP = 'DELETE' then j := to_jsonb(old); else j := to_jsonb(new); end if;
+  row_id := coalesce(j ->> 'id', j ->> 'slug', '');
+  mod := coalesce(j ->> 'module_slug', '');
   insert into public.audit_log (actor, event, entity, entity_id, detail)
   values (
     auth.uid(),
@@ -72,7 +74,8 @@ begin
     row_id,
     jsonb_build_object('module_slug', mod)
   );
-  return coalesce(new, old);
+  if TG_OP = 'DELETE' then return old; end if;
+  return new;
 end $$;
 
 do $$
