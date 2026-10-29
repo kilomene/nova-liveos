@@ -1,4 +1,4 @@
-// Nova LiveOS shell — v1.0.0 "Advanced"
+// Nova LiveOS shell — v1.0.1 "Advanced"
 // Ships empty: navigation, pages and features all come from the data layer
 // (Supabase when configured, local fixture data otherwise) and re-render
 // live when the data changes — no reload, no redeploy.
@@ -15,11 +15,12 @@ import { createAdapter, PRESENCE_WINDOW_MS } from "./lib/data.mjs";
 import { iconSvg, moduleIcon, moduleIconSlug } from "./lib/icons.mjs";
 import {
   cartAdd, cartSetQty, cartRemove, cartView, cartSummary,
-  moveRecordStatus, buildSearchIndex, searchIndex, notificationsFrom,
+  moveRecordStatus, buildSearchIndex, searchIndex, notificationsFrom, isPresenceAudit,
   BLOCK_SCHEMAS, BLOCK_TYPES, addBlock, removeBlock, moveBlockInLayout, applyBlockEdit
 } from "./lib/features.mjs";
 import { runAutomations } from "./lib/features.mjs";
 import { displayNameFromEmail } from "./lib/auth.mjs";
+import { getDataOnline, noteDataSuccess, noteDataFailure, onDataConnectivity } from "./lib/net.mjs";
 
 const config = window.LIVEOS_CONFIG || {};
 const adapter = createAdapter(config);
@@ -34,7 +35,8 @@ const SEEN_KEY = "liveos.notifSeen.v1";
 let state = {
   modules: [], screens: [], records: [], installs: [],
   automations: [], audit: [], profile: null, roles: [],
-  session: null, presence: 1, catalogue: null, booted: false, coreReady: false
+  session: null, presence: 1, catalogue: null, booted: false, coreReady: false,
+  recordsReady: false
 };
 let cart = loadCart();
 let sortState = {};
@@ -99,7 +101,7 @@ function preparedRecords() {
   });
 }
 function renderCtx() {
-  return { records: preparedRecords(), counts: counts(), cart, sortState };
+  return { records: preparedRecords(), counts: counts(), cart, sortState, statsPending: !state.recordsReady };
 }
 
 // ------------------------------------------------------------------- routing
@@ -431,7 +433,7 @@ function adminRecordsView() {
 }
 
 function adminActivityView() {
-  const rows = state.audit.slice(0, 100).map((a) => `<li class="list-row"><span class="notif-icon">${iconSvg("activity", "icon")}</span>
+  const rows = state.audit.filter((a) => !isPresenceAudit(a)).slice(0, 100).map((a) => `<li class="list-row"><span class="notif-icon">${iconSvg("activity", "icon")}</span>
     <div class="list-row-main"><strong>${escapeHtml(a.event)}</strong><span class="list-row-body">${escapeHtml(a.entity || "")}${a.entity_id ? ` · ${escapeHtml(String(a.entity_id).slice(0, 18))}` : ""}${a.detail?.text ? ` — ${escapeHtml(a.detail.text)}` : ""}</span></div>
     <span class="list-row-meta">${escapeHtml(new Date(a.created_at).toLocaleString())}</span></li>`).join("");
   return `${renderBlock({ type: "hero", icon: "activity", title: "Activity", subtitle: "The audit log, newest first. In Supabase mode, database triggers write these rows for every change — whichever client made it. Automation executions are logged here too.", caption: "Activity: the latest 100 audit events." })}
@@ -525,7 +527,7 @@ async function refresh(reason) {
       adapter.getCoreState(),
       adapter.getRecords ? adapter.getRecords() : adapter.getState().then((s) => s.records),
       adapter.getAutomations ? adapter.getAutomations().catch(() => state.automations) : Promise.resolve(state.automations),
-      adapter.getAudit ? adapter.getAudit(30).catch(() => state.audit) : Promise.resolve(state.audit)
+      adapter.getAudit ? adapter.getAudit(100).catch(() => state.audit) : Promise.resolve(state.audit)
     ]);
     state.modules = core.modules;
     state.screens = core.screens;
@@ -534,6 +536,9 @@ async function refresh(reason) {
     state.automations = automations;
     state.audit = audit;
     state.coreReady = true;
+    state.recordsReady = true;
+    noteDataSuccess();
+    updateOnlineBanner();
     if (route().view === "admin" && isAdmin() && adapter.getAdminCatalogue) {
       try { state.catalogue = await adapter.getAdminCatalogue(); } catch { /* keep previous */ }
     }
@@ -541,6 +546,8 @@ async function refresh(reason) {
     if (reason) console.debug("[liveos] re-render:", reason);
   } catch (err) {
     console.error("[liveos] load failed:", err);
+    noteDataFailure(err);
+    updateOnlineBanner();
     app.innerHTML = `<section class="block"><h1>Couldn't load LiveOS data</h1><p>${escapeHtml(err?.message || String(err))}</p><p><button class="btn btn-primary" id="retryBtn">Retry</button></p></section>`;
     document.getElementById("retryBtn")?.addEventListener("click", () => boot());
   }
@@ -555,10 +562,21 @@ async function boot() {
     state.modules = core.modules;
     state.screens = core.screens;
     state.installs = core.installs;
+    // The local adapter's core state already carries the records; adopt
+    // them so the first paint shows real stats. The Supabase core state
+    // has none — recordsReady stays false and stats render as skeletons
+    // until refresh() lands the first live records load.
+    if (Array.isArray(core.records)) {
+      state.records = core.records;
+      state.recordsReady = true;
+    }
     state.coreReady = true;
+    noteDataSuccess();
     render();
   } catch (err) {
     console.error("[liveos] core load failed:", err);
+    noteDataFailure(err);
+    updateOnlineBanner();
     app.innerHTML = `<section class="block"><h1>Couldn't load LiveOS data</h1><p>${escapeHtml(err?.message || String(err))}</p><p><button class="btn btn-primary" id="retryBtn">Retry</button></p></section>`;
     document.getElementById("retryBtn")?.addEventListener("click", () => boot());
     return;
@@ -602,7 +620,7 @@ async function runEngine(event) {
         detail: { trigger: event.type, action: a.type }
       }).catch(() => null);
     }
-    state.audit = await adapter.getAudit(30).catch(() => state.audit);
+    state.audit = await adapter.getAudit(100).catch(() => state.audit);
     render();
   } catch (err) {
     console.error("[liveos] automation failed:", err);
@@ -1141,12 +1159,26 @@ async function promptInstall() {
   deferredInstallPrompt = null;
   render();
 }
+// The offline banner is driven by REAL data-layer connectivity (lib/net):
+// it appears only after an actual data fetch/refresh fails with a network
+// error, and hides on the next success. The browser's own onLine flag is
+// never read — it lied persistently in environments where Supabase traffic was flowing
+// (the v1.0.0 false "You are offline" defect). The window online/offline
+// events are hints only: 'online' triggers a refresh attempt (whose
+// outcome drives the banner), 'offline' triggers a silent probe — if
+// data still loads, the banner stays hidden.
 function updateOnlineBanner() {
   const el = document.getElementById("offlineBanner");
-  if (el) el.classList.toggle("show", !navigator.onLine);
+  if (el) el.classList.toggle("show", !getDataOnline());
 }
-window.addEventListener("online", updateOnlineBanner);
-window.addEventListener("offline", updateOnlineBanner);
+onDataConnectivity(() => updateOnlineBanner());
+window.addEventListener("online", () => { refresh("online-event"); });
+window.addEventListener("offline", async () => {
+  if (adapter.mode !== "supabase") { noteDataSuccess(); updateOnlineBanner(); return; }
+  try { await adapter.getCoreState(); noteDataSuccess(); }
+  catch (err) { noteDataFailure(err); }
+  updateOnlineBanner();
+});
 
 // ---------------------------------------------------------------------- init
 window.addEventListener("hashchange", async () => {
@@ -1174,6 +1206,25 @@ updateOnlineBanner();
 render();
 adapter.onChange(() => refresh("change-event"));
 if ("serviceWorker" in navigator) {
+  // One-time auto-reload when a NEW service worker takes control of a
+  // page an old one was already controlling (an upgrade): the shell
+  // assets should come from the new worker without the user ever
+  // reloading by hand. The sessionStorage flag makes a loop impossible —
+  // after one reload this session never auto-reloads again.
+  let swReloadAttempted = false;
+  let swHadController = !!navigator.serviceWorker.controller;
+  navigator.serviceWorker.addEventListener("controllerchange", () => {
+    // The first controllerchange on a fresh install is just the initial
+    // claim — the page loaded fresh from the network, nothing to reload.
+    if (!swHadController) { swHadController = true; return; }
+    if (swReloadAttempted) return;
+    swReloadAttempted = true;
+    try {
+      if (sessionStorage.getItem("liveos.swReloaded") === "1") return;
+      sessionStorage.setItem("liveos.swReloaded", "1");
+    } catch { return; /* storage unavailable: never risk a reload loop */ }
+    location.reload();
+  });
   navigator.serviceWorker.register("sw.js").catch(() => { /* offline shell is best-effort */ });
 }
 boot();

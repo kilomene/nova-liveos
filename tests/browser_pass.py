@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Nova LiveOS browser QA pass — v1.0.0.
+"""Nova LiveOS browser QA pass — v1.0.1.
 Serves a copy of public/ (with a PLACEHOLDER config, so the pass always runs
 in local fixture mode) and drives headless Chromium (Playwright) through
 the v1.0 flows: home/drawer/store, kanban moves (buttons + real drag),
@@ -29,7 +29,7 @@ def check(name, cond, detail=""):
 serve_dir = Path(tempfile.mkdtemp(prefix="liveos-pass-"))
 shutil.copytree(ROOT / "public", serve_dir, dirs_exist_ok=True)
 (serve_dir / "config.js").write_text(
-    'window.LIVEOS_CONFIG = { version: "1.0.0", supabaseUrl: "", supabaseAnonKey: "" };\n')
+    'window.LIVEOS_CONFIG = { version: "1.0.1", supabaseUrl: "", supabaseAnonKey: "" };\n')
 
 server = subprocess.Popen([sys.executable, "-m", "http.server", str(PORT), "--directory", str(serve_dir)],
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -55,7 +55,8 @@ try:
         page.wait_for_selector("text=One shell. Everything else is data.", timeout=10000)
         check("home renders from fixture screens", True)
         check("home shows live status (local)", "local mode" in page.inner_text("#liveStatus"))
-        check("footer version is 1.0.0", "v1.0.0" in page.inner_text("#drawer"))
+        check("fresh first load shows footer version 1.0.1 immediately", "v1.0.1" in page.inner_text("#drawer"))
+        check("no offline banner while data loads successfully", not page.locator("#offlineBanner.show").count())
         page.screenshot(path=str(MANIFEST / "01-home.png"))
 
         page2.goto(BASE + "/#/m/chat")
@@ -185,6 +186,36 @@ try:
         page.wait_for_function("document.querySelector('#presenceChip').innerText.includes('2 online')", timeout=30000)
         check("presence counts both live shells", True)
 
+        # -------------------------------------- v1.0.1 defect 3: badge must not climb from presence
+        def badge_value(pg):
+            return pg.evaluate("""() => {
+              const b = document.querySelector('#bellBadge');
+              return (!b || b.style.display === 'none') ? 0 : Number(b.innerText) || 0;
+            }""")
+        badge_before = badge_value(page)
+        # Simulate the Supabase-side churn: heartbeat inserts land in the
+        # audit log as insert.records rows for liveos-core (the DB trigger
+        # mirror). Inject a batch into the shared local store from shell 2;
+        # shell 1 reloads on the storage event and must filter them all.
+        page2.evaluate("""() => {
+          const raw = localStorage.getItem('liveos.local.v1');
+          const st = JSON.parse(raw);
+          const now = new Date().toISOString();
+          for (let i = 0; i < 12; i++) {
+            st.audit.push({ id: 'audit_fake_' + i, actor: 'local', event: 'insert.records',
+              entity: 'records', entity_id: 'presence-' + i,
+              detail: { module_slug: 'liveos-core' }, created_at: now });
+          }
+          localStorage.setItem('liveos.local.v1', JSON.stringify(st));
+        }""")
+        page.wait_for_timeout(3000)
+        check("badge ignores presence audit churn (12 injected heartbeat mirrors)",
+              badge_value(page) == badge_before, f"before={badge_before} after={badge_value(page)}")
+        # Two shells sit open ~60s heartbeating: the badge must not move.
+        page.wait_for_timeout(60000)
+        check("badge does not climb while two shells heartbeat for ~60s",
+              badge_value(page) == badge_before, f"before={badge_before} after={badge_value(page)}")
+
         # ---------------------------------------------------------- contacts CRM
         page.goto(BASE + "/#/m/contacts")
         install_btn = page.locator(".install-btn")
@@ -263,7 +294,26 @@ try:
         page.wait_for_selector("text=Notifications", timeout=5000)
         notif_text = page.inner_text("#app")
         check("notifications feed shows workspace activity", "mini-shop" in notif_text or "Order" in notif_text or "chat" in notif_text)
+        page.wait_for_timeout(800)
+        check("opening notifications marks seen and the badge resets to 0", badge_value(page) == 0,
+              f"badge={badge_value(page)}")
         page.screenshot(path=str(MANIFEST / "14-notifications.png"))
+
+        # -------------------------------------- v1.0.1 defect 2: false offline banner
+        # A separate fresh profile whose navigator.onLine reports FALSE the
+        # whole time (the environment that produced the false banner): the
+        # banner must stay hidden because data fetches succeed.
+        ctx2 = browser.new_context(viewport={"width": 1280, "height": 900})
+        ctx2.add_init_script("Object.defineProperty(navigator, 'onLine', { get: () => false });")
+        page3 = ctx2.new_page()
+        page3.on("pageerror", lambda e: errors.append(f"pageerror(offline-test): {e}"))
+        page3.goto(BASE + "/")
+        page3.wait_for_selector("text=One shell. Everything else is data.", timeout=10000)
+        page3.wait_for_timeout(2500)
+        check("navigator.onLine === false in the test profile", page3.evaluate("navigator.onLine") is False)
+        check("no offline banner while data loads with onLine forced false",
+              not page3.locator("#offlineBanner.show").count())
+        ctx2.close()
 
         # ---------------------------------------------------------- live-change simulation still works
         page.goto(BASE + "/#/m/team-board")

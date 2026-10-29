@@ -1,4 +1,4 @@
-// Nova LiveOS feature logic — v1.0.0
+// Nova LiveOS feature logic — v1.0.1
 // Pure, testable logic shared by the shell and the test suite: cart maths,
 // kanban moves, global search, notification derivation, the admin block
 // editor model, and the in-shell automation engine.
@@ -85,13 +85,42 @@ export function searchIndex(index, query, limit = 12) {
 
 // ------------------------------------------------------------- notifications
 // Derived, not stored: anything created after `sinceTs` (records + audit
-// events) is a notification. Presence chatter never reaches this list
-// because presence rows live outside `records` in shell state.
+// events) is a notification.
+//
+// v1.0.1 — presence/heartbeat churn must NEVER surface here. In Supabase
+// mode every heartbeat is an INSERT into records (module 'liveos-core',
+// kind 'presence'), and the 0003 audit trigger mirrors it into audit_log
+// as `insert.records` with detail.module_slug = 'liveos-core'. Both forms
+// are filtered below (the old comment claimed presence "never reaches
+// this list" — true for local mode, false for the audit half in Supabase
+// mode, which is exactly how the badge climbed 2 → 37 in one session).
+// Two more inflation sources are removed at the same layer:
+//   - mechanical DB-trigger audit rows (insert./update./delete.<table>)
+//     are raw change mirrors for the Admin Activity viewer, not
+//     user-facing events;
+//   - an audit row that merely mirrors a record already in the list
+//     (same entity_id, e.g. the local store's `record.created` entry)
+//     would double-count one real event, so it is dropped.
+export const PRESENCE_MODULE_SLUG = "liveos-core";
+const MECHANICAL_AUDIT_EVENT = /^(insert|update|delete)\./;
+
+export function isPresenceRecord(r) {
+  return r?.module_slug === PRESENCE_MODULE_SLUG || r?.kind === "presence";
+}
+export function isPresenceAudit(a) {
+  return a?.detail?.module_slug === PRESENCE_MODULE_SLUG
+    || a?.detail?.kind === "presence"
+    || /(^|\.)presence(\.|$)/.test(String(a?.event || ""));
+}
+
 export function notificationsFrom({ records = [], audit = [] } = {}, sinceTs = 0, limit = 30) {
   const items = [];
+  const recordIds = new Set();
   for (const r of records) {
+    if (isPresenceRecord(r)) continue;
     const ts = Date.parse(r.created_at || "") || 0;
     if (ts <= sinceTs) continue;
+    recordIds.add(String(r.id));
     const p = r.payload || {};
     const label = p.title || p.name || p.product || p.summary || p.text || r.kind;
     items.push({
@@ -101,6 +130,9 @@ export function notificationsFrom({ records = [], audit = [] } = {}, sinceTs = 0
     });
   }
   for (const a of audit) {
+    if (isPresenceAudit(a)) continue;
+    if (MECHANICAL_AUDIT_EVENT.test(String(a.event || ""))) continue;
+    if (a.entity === "records" && a.entity_id && recordIds.has(String(a.entity_id))) continue;
     const ts = Date.parse(a.created_at || "") || 0;
     if (ts <= sinceTs) continue;
     items.push({

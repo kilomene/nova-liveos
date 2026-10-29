@@ -1,4 +1,4 @@
-// Nova LiveOS block renderer — v1.0.0
+// Nova LiveOS block renderer — v1.0.1
 // Pure functions: layout JSON in, HTML string out. No DOM access, so the same
 // code runs in the browser shell and in the node test suite.
 // v1.0 adds: kanban, table (sortable), gallery, chart (hand-rolled SVG),
@@ -123,8 +123,12 @@ function renderChart(block, context) {
   if (!data.length) {
     inner = `<text x="${W / 2}" y="${H / 2}" text-anchor="middle" class="chart-empty">No data yet</text>`;
   } else if ((block.chart || "bar") === "line") {
-    const stepX = data.length > 1 ? (W - PADL * 2) / (data.length - 1) : 0;
-    const pts = data.map((d, i) => [PADL + i * stepX, PADT + (H - PADT - PADB) * (1 - d.value / max)]);
+    // v1.0.1: x labels are middle-anchored on their points, so the first
+    // and last points need real horizontal padding — at PADL=8 the first
+    // label ("10-29") overflowed the left edge and rendered as "0-29".
+    const PADX = 30;
+    const stepX = data.length > 1 ? (W - PADX * 2) / (data.length - 1) : 0;
+    const pts = data.map((d, i) => [data.length > 1 ? PADX + i * stepX : W / 2, PADT + (H - PADT - PADB) * (1 - d.value / max)]);
     const path = pts.map((p, i) => `${i ? "L" : "M"}${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(" ");
     inner = `<path d="${path}" fill="none" stroke="var(--green)" stroke-width="2.5" stroke-linejoin="round"/>` +
       pts.map((p, i) => `<circle cx="${p[0]}" cy="${p[1]}" r="3.5" fill="var(--pink)"/><text x="${p[0]}" y="${p[1] - 8}" text-anchor="middle" class="chart-val">${escapeHtml(data[i].value)}</text><text x="${p[0]}" y="${H - 6}" text-anchor="middle" class="chart-lab">${escapeHtml(data[i].label.slice(5) || data[i].label)}</text>`).join("");
@@ -218,6 +222,13 @@ export function renderBlock(block, context = {}) {
       return `<section class="block rich-text">${sectionHead(block)}<div class="md">${renderMarkdown(block.markdown ?? block.text ?? "")}</div></section>`;
     case "stats": {
       const items = (block.items || []).map((item) => {
+        // v1.0.1: before the first live records load lands, countKey stats
+        // render a skeleton placeholder — never a final-looking number
+        // (the shell used to paint the pre-load 0, then jump to the real
+        // count when records arrived: the "stat flicker").
+        if (item.countKey && context.statsPending) {
+          return `<div class="stat"><div class="skel skel-num" aria-label="Loading"></div><div class="stat-label">${escapeHtml(item.label || "")}</div></div>`;
+        }
         const value = item.countKey ? (context.counts?.[item.countKey] ?? 0) : (item.value ?? "");
         const numeric = typeof value === "number" || /^\d+$/.test(String(value));
         return `<div class="stat"><div class="stat-value" ${numeric ? `data-count="${escapeHtml(value)}"` : ""}>${escapeHtml(value)}</div><div class="stat-label">${escapeHtml(item.label || "")}</div></div>`;

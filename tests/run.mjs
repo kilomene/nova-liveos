@@ -1,4 +1,4 @@
-// Nova LiveOS test suite — v1.0.0. Zero dependencies: `node tests/run.mjs`.
+// Nova LiveOS test suite — v1.0.1. Zero dependencies: `node tests/run.mjs`.
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -6,8 +6,8 @@ import { renderBlock, renderScreen, fillTemplate, escapeHtml, renderMarkdown, ag
 import { createLocalStore, selectMode, SupabaseAdapter, isUuid } from "../public/lib/data.mjs";
 import { SEED } from "../public/lib/seed-data.mjs";
 import { ICONS, ICON_SLUGS, isIconSlug, iconSvg, moduleIconSlug, moduleIcon } from "../public/lib/icons.mjs";
-import { cartAdd, cartSetQty, cartRemove, cartView, cartSummary, moveRecordStatus, buildSearchIndex, searchIndex, notificationsFrom, BLOCK_SCHEMAS, BLOCK_TYPES, addBlock, removeBlock, moveBlockInLayout, applyBlockEdit, runAutomations, automationMatches } from "../public/lib/features.mjs";
-import { fetchWithRetry } from "../public/lib/net.mjs";
+import { cartAdd, cartSetQty, cartRemove, cartView, cartSummary, moveRecordStatus, buildSearchIndex, searchIndex, notificationsFrom, isPresenceRecord, isPresenceAudit, BLOCK_SCHEMAS, BLOCK_TYPES, addBlock, removeBlock, moveBlockInLayout, applyBlockEdit, runAutomations, automationMatches } from "../public/lib/features.mjs";
+import { fetchWithRetry, isNetworkError, noteDataSuccess, noteDataFailure, getDataOnline, onDataConnectivity } from "../public/lib/net.mjs";
 import { sessionFromAuthResponse, parseStoredSession, isSessionExpired, displayNameFromEmail, AuthClient } from "../public/lib/auth.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -340,11 +340,79 @@ check("migration 0003 widens records update/delete to null-created rows", mig3.i
 check("migration 0003 seeds the engine automations", mig3.includes("order-activity") && mig3.includes("bid-activity") && mig3.includes("job-audit"));
 check("migration 0003 has no service-role key", !/service_role|SERVICE_ROLE/.test(mig3));
 const swJs = readFileSync(join(root, "public/sw.js"), "utf8");
-check("service worker cache is liveos-shell-1.0.0", swJs.includes('liveos-shell-1.0.0'));
+check("service worker cache is liveos-shell-1.0.1", swJs.includes('liveos-shell-1.0.1'));
 check("service worker caches the new lib modules", swJs.includes("icons.mjs") && swJs.includes("features.mjs") && swJs.includes("auth.mjs") && swJs.includes("net.mjs"));
+// v1.0.1 defect 1: the fetch handler must be network-first — the network
+// fetch must appear before any cache lookup in the handler, and the cache
+// may only be consulted inside the fetch failure path.
+const fetchHandler = swJs.slice(swJs.indexOf('addEventListener("fetch"'));
+check("service worker fetch handler is network-first", fetchHandler.indexOf("fetch(e.request)") >= 0 && fetchHandler.indexOf("fetch(e.request)") < fetchHandler.indexOf("caches.match"));
+check("service worker still bypasses cross-origin/non-GET", fetchHandler.includes('url.origin !== location.origin') && fetchHandler.includes('e.request.method !== "GET"'));
+const appJs = readFileSync(join(root, "public/app.js"), "utf8");
+check("app registers a controllerchange auto-reload guard", appJs.includes("controllerchange") && appJs.includes("liveos.swReloaded") && appJs.includes("sessionStorage"));
+check("app version header is v1.0.1", appJs.includes("Nova LiveOS shell — v1.0.1"));
 const indexHtml = readFileSync(join(root, "public/index.html"), "utf8");
-check("index footer says v1.0.0", indexHtml.includes("A Nova company · v1.0.0"));
+check("index footer says v1.0.1", indexHtml.includes("A Nova company · v1.0.1"));
 check("index has palette + account + badges mounts", indexHtml.includes('id="palette"') && indexHtml.includes('id="drawerAccount"') && indexHtml.includes('id="bellBadge"'));
+
+// ============================================================ v1.0.1 sections
+// ------------------------------------------------- defect 3: notifications
+const nNow = new Date().toISOString();
+check("isPresenceRecord spots liveos-core + kind presence", isPresenceRecord({ module_slug: "liveos-core", kind: "presence" }) && isPresenceRecord({ module_slug: "chat", kind: "presence" }) && !isPresenceRecord({ module_slug: "chat", kind: "message" }));
+check("isPresenceAudit spots the trigger mirror of a heartbeat", isPresenceAudit({ event: "insert.records", entity: "records", detail: { module_slug: "liveos-core" } }) && !isPresenceAudit({ event: "automation.new-job", detail: { text: "x" } }));
+const churnAudit = Array.from({ length: 25 }, (_, i) => ({
+  event: "insert.records", entity: "records", entity_id: `presence-${i}`,
+  detail: { module_slug: "liveos-core" }, created_at: nNow
+}));
+check("presence audit churn produces zero notifications", notificationsFrom({ records: [], audit: churnAudit }, 0, 99).length === 0);
+check("a leaked presence record produces no notification", notificationsFrom({
+  records: [{ id: "p1", module_slug: "liveos-core", kind: "presence", payload: { shell: "s1" }, created_at: nNow }], audit: []
+}, 0).length === 0);
+check("mechanical trigger audit rows are not notifications", notificationsFrom({
+  records: [], audit: [{ event: "insert.records", entity: "records", entity_id: "zzz", detail: { module_slug: "chat" }, created_at: nNow }]
+}, 0).length === 0);
+check("an audit row mirroring a listed record does not double-count", notificationsFrom({
+  records: [{ id: "r9", module_slug: "chat", kind: "message", payload: { text: "hi" }, created_at: nNow }],
+  audit: [{ event: "record.created", entity: "records", entity_id: "r9", detail: {}, created_at: nNow }]
+}, 0).length === 1);
+check("semantic audit events still notify", notificationsFrom({
+  records: [], audit: [{ event: "automation.new-job", entity: "automations", entity_id: "job-audit", detail: { text: "New job posted: X" }, created_at: nNow }]
+}, 0).length === 1);
+
+// ------------------------------------------------- defect 2: connectivity
+check("isNetworkError accepts fetch TypeError + timeout", isNetworkError(new TypeError("Failed to fetch")) && isNetworkError(new Error("Request timed out after 8000ms: https://x")));
+check("isNetworkError rejects HTTP status errors", !isNetworkError(Object.assign(new Error("HTTP 500"), { status: 500 })) && !isNetworkError(new Error("some other bug")));
+noteDataSuccess();
+check("connectivity starts online after a success", getDataOnline() === true);
+let connEvents = [];
+const unsubConn = onDataConnectivity((v) => connEvents.push(v));
+noteDataFailure(new TypeError("Failed to fetch"));
+check("a network failure flips connectivity offline + notifies", getDataOnline() === false && connEvents.join() === "false");
+noteDataFailure(Object.assign(new Error("HTTP 503"), { status: 503 }));
+check("an HTTP error does not change connectivity state", getDataOnline() === false && connEvents.length === 1);
+noteDataSuccess();
+check("the next success restores connectivity + notifies", getDataOnline() === true && connEvents.join() === "false,true");
+unsubConn();
+let netErr = null;
+try { await fetchWithRetry("https://down.example", {}, { fetchImpl: async () => { throw new TypeError("Failed to fetch"); }, retries: 0, backoffMs: 1 }); }
+catch (e) { netErr = e; }
+check("fetchWithRetry network failure drives connectivity offline", !!netErr && getDataOnline() === false);
+const okRes = await fetchWithRetry("https://up.example", {}, { fetchImpl: async () => ({ ok: true, status: 200 }), retries: 0 });
+check("fetchWithRetry success drives connectivity back online", okRes.ok && getDataOnline() === true);
+check("app banner is driven by the data layer, never navigator.onLine", !appJs.includes("navigator.onLine") && appJs.includes("getDataOnline()") && appJs.includes('refresh("online-event")'));
+
+// ------------------------------------------------- stat flicker + chart label
+const pendingStats = renderBlock({ type: "stats", items: [{ label: "Items", countKey: "team-board:task" }] }, { counts: { "team-board:task": 4 }, statsPending: true });
+check("statsPending renders a skeleton, not a final-looking number", pendingStats.includes("skel-num") && !pendingStats.includes(">4<") && !pendingStats.includes("data-count"));
+check("stats render real numbers once records are ready", renderBlock({ type: "stats", items: [{ label: "Items", countKey: "team-board:task" }] }, { counts: { "team-board:task": 4 }, statsPending: false }).includes(">4<"));
+const dayLine = renderBlock({ type: "chart", title: "Activity by day", chart: "line", groupBy: "day", value: "count" },
+  { records: [
+    { id: "d1", module_slug: "chat", kind: "message", payload: {}, created_at: "2026-10-29T08:00:00Z" },
+    { id: "d2", module_slug: "chat", kind: "message", payload: {}, created_at: "2026-10-30T08:00:00Z" }
+  ] });
+check("day line chart shows the full 10-29 label", dayLine.includes(">10-29<"));
+const firstCx = Number((dayLine.match(/<circle cx="([\d.]+)"/) || [])[1]);
+check("day line chart first point is padded from the edge (no label clipping)", firstCx >= 30, `cx=${firstCx}`);
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);
