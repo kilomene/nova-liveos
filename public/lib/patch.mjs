@@ -1,4 +1,4 @@
-// Nova LiveOS DOM patcher — v1.0.4
+// Nova LiveOS DOM patcher — v1.0.5
 // In-place reconciliation used by the shell's render(): instead of
 // replacing #app's innerHTML wholesale (which visibly blinked on every
 // background refresh — scroll jumped, inputs lost focus and content,

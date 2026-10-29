@@ -1,4 +1,4 @@
-// Nova LiveOS refresh coordination — v1.0.4
+// Nova LiveOS refresh coordination — v1.0.5
 // Two guards that make state replacement MONOTONIC:
 //
 // 1. Cycle sequencing. Refresh cycles can overlap (realtime events, the

@@ -1,4 +1,4 @@
-// Nova LiveOS local fixture data — v1.0.4
+// Nova LiveOS local fixture data — v1.0.5
 // This mirrors supabase/seed.sql. In local mode (no Supabase configured) the
 // shell runs entirely from this fixture, stored in localStorage so installs,
 // records, automations and live-change simulations persist across reloads.

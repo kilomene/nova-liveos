@@ -1,4 +1,4 @@
-// Nova LiveOS shell — v1.0.4 "Advanced"
+// Nova LiveOS shell — v1.0.5 "Advanced"
 // Ships empty: navigation, pages and features all come from the data layer
 // (Supabase when configured, local fixture data otherwise) and re-render
 // live when the data changes — no reload, no redeploy.

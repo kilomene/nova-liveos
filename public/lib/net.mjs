@@ -1,4 +1,4 @@
-// Nova LiveOS network helpers — v1.0.4
+// Nova LiveOS network helpers — v1.0.5
 // fetch with a hard timeout and one automatic retry. The v0.1 cold-load
 // defect was a single slow query stalling the whole shell forever; every
 // data call in v1.0 goes through here so a slow request fails visibly and

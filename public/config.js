@@ -1,10 +1,8 @@
-// Nova LiveOS configuration — v1.0.4
-// Leave these as placeholders to run in LOCAL mode (fixture data, no account
-// needed). The installer (install.sh) rewrites this file with your own fresh
-// Supabase project's URL + anon key; that config change is the ONLY step that
-// switches the shell to live Supabase data. Never put a service-role key here.
+// Nova LiveOS configuration — v1.0.5
+// Placeholder for the public repo. The deployed copy is wired to the
+// owner's Supabase project at deploy time; never commit real keys.
 window.LIVEOS_CONFIG = {
-  version: "1.0.4",
+  version: "1.0.5",
   supabaseUrl: "",
   supabaseAnonKey: ""
 };

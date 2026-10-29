@@ -1,4 +1,4 @@
-// Nova LiveOS data layer — v1.0.4
+// Nova LiveOS data layer — v1.0.5
 // Two adapters behind one interface:
 //   LocalAdapter    — fixture data in localStorage (works offline, no account)
 //   SupabaseAdapter — PostgREST via fetch with the anon key (or the signed-in
@@ -10,7 +10,7 @@
 
 import { SEED } from "./seed-data.mjs";
 import { fetchWithRetry } from "./net.mjs";
-import { AuthClient, displayNameFromEmail, SESSION_KEY } from "./auth.mjs";
+import { AuthClient, displayNameFromEmail, isSessionExpired, SESSION_KEY } from "./auth.mjs";
 
 export function selectMode(config) {
   const url = config?.supabaseUrl || "";
@@ -393,16 +393,63 @@ export class SupabaseAdapter {
     this._hash = "";
     this._timer = null;
     this._ws = null;
+    this._sessionSync = null;
   }
   _headers(extra = {}) {
     const token = this.session?.access_token || this.key;
     return { apikey: this.key, Authorization: `Bearer ${token}`, "Content-Type": "application/json", ...extra };
   }
-  async _req(method, path, body, extraHeaders = {}) {
+  // v1.0.5 AUTH SELF-HEAL: Supabase access tokens live ~1h, but before
+  // this patch the data path never refreshed one — an expired stored
+  // session made EVERY request 401 ("JWT expired") and bricked the
+  // shell on a dead-end error screen whose Retry reused the same dead
+  // token. Now a single shared sync asks AuthClient for a valid session
+  // (refreshing if needed, clearing if revoked) and mirrors the result
+  // into the adapter's session + identity. Concurrent callers share the
+  // one in-flight sync instead of racing refreshes.
+  _syncSessionFromAuth() {
+    if (this._sessionSync) return this._sessionSync;
+    const sync = (async () => {
+      let session = null;
+      try {
+        session = await this.auth.validSession();
+      } catch {
+        // validSession() normally absorbs refresh failures itself; if it
+        // ever throws, the session is treated as cleared and callers
+        // fall back to the anon key rather than the dead token.
+        session = null;
+        try { this.auth._save(null); } catch { /* already gone */ }
+      }
+      this.session = session || null;
+      this.userId = this.session?.user?.id || this.anonId;
+      return this.session;
+    })();
+    this._sessionSync = sync;
+    const clear = () => { if (this._sessionSync === sync) this._sessionSync = null; };
+    sync.then(clear, clear);
+    return sync;
+  }
+  // Proactive heal: refresh an expired/near-expiry session BEFORE the
+  // first data request of a boot/refresh cycle, so a healthy refresh
+  // avoids the doomed 401 round trip entirely.
+  async _ensureFreshSession() {
+    if (!this.session?.access_token || !isSessionExpired(this.session)) return this.session;
+    return this._syncSessionFromAuth();
+  }
+  async _req(method, path, body, extraHeaders = {}, _authRetried = false) {
     const res = await fetchWithRetry(`${this.url}/rest/v1/${path}`, {
       method, headers: this._headers(extraHeaders),
       body: body === undefined ? undefined : JSON.stringify(body)
     });
+    // One recovery per request: a 401 while holding a user session gets
+    // exactly one session sync + one retry with rebuilt headers. Anon
+    // 401s, and a second 401, throw as before. The 401 is an HTTP
+    // response, so fetchWithRetry never counts it as a connectivity
+    // failure (net.mjs anti-flap gate is untouched by the heal).
+    if (res.status === 401 && !_authRetried && this.session?.access_token) {
+      await this._syncSessionFromAuth();
+      return this._req(method, path, body, extraHeaders, true);
+    }
     if (!res.ok) {
       let detail = "";
       try { detail = (await res.json())?.message || ""; } catch { /* ignore */ }
@@ -417,6 +464,7 @@ export class SupabaseAdapter {
   // Fast path: catalogue + installs only (no records). Boot renders from
   // this; records stream in right behind it.
   async getCoreState() {
+    await this._ensureFreshSession();
     const [modules, screens, installs] = await Promise.all([
       this._get("modules?select=*&published=eq.true&order=slug"),
       this._get("screens?select=*&published=eq.true"),
@@ -428,6 +476,7 @@ export class SupabaseAdapter {
     return this._get(`records?select=*&module_slug=neq.${PRESENCE_MODULE}&order=created_at.asc`);
   }
   async getState() {
+    await this._ensureFreshSession();
     const [core, records] = await Promise.all([this.getCoreState(), this.getRecords()]);
     return { ...core, records };
   }

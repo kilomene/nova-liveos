@@ -1,4 +1,4 @@
-// Nova LiveOS test suite — v1.0.4. Zero dependencies: `node tests/run.mjs`.
+// Nova LiveOS test suite — v1.0.5. Zero dependencies: `node tests/run.mjs`.
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -8,7 +8,7 @@ import { SEED } from "../public/lib/seed-data.mjs";
 import { ICONS, ICON_SLUGS, isIconSlug, iconSvg, moduleIconSlug, moduleIcon } from "../public/lib/icons.mjs";
 import { cartAdd, cartSetQty, cartRemove, cartView, cartSummary, moveRecordStatus, buildSearchIndex, searchIndex, notificationsFrom, isPresenceRecord, isPresenceAudit, BLOCK_SCHEMAS, BLOCK_TYPES, addBlock, removeBlock, moveBlockInLayout, applyBlockEdit, runAutomations, automationMatches } from "../public/lib/features.mjs";
 import { fetchWithRetry, isNetworkError, noteDataSuccess, noteDataFailure, getDataOnline, onDataConnectivity, OFFLINE_AFTER_FAILURES, getConsecutiveDataFailures } from "../public/lib/net.mjs";
-import { sessionFromAuthResponse, parseStoredSession, isSessionExpired, displayNameFromEmail, AuthClient } from "../public/lib/auth.mjs";
+import { sessionFromAuthResponse, parseStoredSession, isSessionExpired, displayNameFromEmail, AuthClient, SESSION_KEY } from "../public/lib/auth.mjs";
 import { SNAPSHOT_KEY, SNAPSHOT_VERSION, MAX_SNAPSHOT_AGE_MS, snapshotIdentity, buildSnapshot, parseSnapshot, readSnapshot, writeSnapshot } from "../public/lib/snapshot.mjs";
 import { settle, createCycleTracker, buildCandidate, dataStatesEqual } from "../public/lib/refresh.mjs";
 
@@ -342,7 +342,7 @@ check("migration 0003 widens records update/delete to null-created rows", mig3.i
 check("migration 0003 seeds the engine automations", mig3.includes("order-activity") && mig3.includes("bid-activity") && mig3.includes("job-audit"));
 check("migration 0003 has no service-role key", !/service_role|SERVICE_ROLE/.test(mig3));
 const swJs = readFileSync(join(root, "public/sw.js"), "utf8");
-check("service worker cache is liveos-shell-1.0.4", swJs.includes('liveos-shell-1.0.4'));
+check("service worker cache is liveos-shell-1.0.5", swJs.includes('liveos-shell-1.0.5'));
 check("service worker caches the new lib modules", swJs.includes("icons.mjs") && swJs.includes("features.mjs") && swJs.includes("auth.mjs") && swJs.includes("net.mjs") && swJs.includes("snapshot.mjs") && swJs.includes("refresh.mjs") && swJs.includes("patch.mjs"));
 // v1.0.1 defect 1: the fetch handler must be network-first — the network
 // fetch must appear before any cache lookup in the handler, and the cache
@@ -352,9 +352,9 @@ check("service worker fetch handler is network-first", fetchHandler.indexOf("fet
 check("service worker still bypasses cross-origin/non-GET", fetchHandler.includes('url.origin !== location.origin') && fetchHandler.includes('e.request.method !== "GET"'));
 const appJs = readFileSync(join(root, "public/app.js"), "utf8");
 check("app registers a controllerchange auto-reload guard", appJs.includes("controllerchange") && appJs.includes("liveos.swReloaded") && appJs.includes("sessionStorage"));
-check("app version header is v1.0.4", appJs.includes("Nova LiveOS shell — v1.0.4"));
+check("app version header is v1.0.5", appJs.includes("Nova LiveOS shell — v1.0.5"));
 const indexHtml = readFileSync(join(root, "public/index.html"), "utf8");
-check("index footer says v1.0.4", indexHtml.includes("A Nova company · v1.0.4"));
+check("index footer says v1.0.5", indexHtml.includes("A Nova company · v1.0.5"));
 check("index has palette + account + badges mounts", indexHtml.includes('id="palette"') && indexHtml.includes('id="drawerAccount"') && indexHtml.includes('id="bellBadge"'));
 
 // ============================================================ v1.0.1 sections
@@ -429,7 +429,7 @@ check("day line chart first point is padded from the edge (no label clipping)", 
 // never loads the new app.js, so the escape must live in sw.js itself —
 // the browser's SW update check is the one delivery that bypasses the
 // old worker). Static assertions on the worker's source.
-check("sw header is v1.0.4", swJs.includes("service worker — v1.0.4"));
+check("sw header is v1.0.5", swJs.includes("service worker — v1.0.5"));
 check("sw self-rescue collects window clients on activate", swJs.includes("clients.matchAll") && swJs.includes('type: "window"') && swJs.includes("includeUncontrolled"));
 check("sw self-rescue force-navigates clients onto the new shell", swJs.includes("client.navigate(client.url)"));
 check("sw self-rescue is gated on replacing a different version (stale caches existed)",
@@ -711,6 +711,124 @@ check("gate: after a reset, two failures are tolerated again", getDataOnline() =
 noteDataSuccess();
 unsubGate();
 
+// ============================================================ v1.0.5 sections
+// ------------------------------------------------- auth self-heal (401)
+// The owner's live defect (2026-10-29): a stored session's access token
+// dies after ~1h; from then on EVERY data request 401s ("JWT expired")
+// and the shell bricked on its error screen, whose Retry reused the
+// same dead token. The data layer must now heal exactly once per
+// request (refresh -> retry with the NEW token; revoked -> session
+// cleared -> retry with the ANON key), never heal for anon, never loop,
+// and proactively refresh before boot fetches. Mock fetch stands at
+// BOTH boundaries: the GoTrue token endpoint and PostgREST.
+function mockRes(status, body) {
+  const text = body === undefined ? "" : (typeof body === "string" ? body : JSON.stringify(body));
+  return { ok: status >= 200 && status < 300, status,
+    text: async () => text, json: async () => (text ? JSON.parse(text) : null) };
+}
+function healStorage(session) {
+  const m = new Map();
+  if (session) m.set(SESSION_KEY, JSON.stringify(session));
+  return { getItem: (k) => (m.has(k) ? m.get(k) : null),
+    setItem: (k, v) => m.set(k, String(v)), removeItem: (k) => m.delete(k) };
+}
+const expiredSess = (token, refresh, userId) => ({
+  access_token: token, refresh_token: refresh, expires_at: Date.now() - 60_000,
+  user: { id: userId, email: "owner@x.com" }
+});
+const ANON_AUTH = `Bearer ${sbCfg.supabaseAnonKey}`;
+let heal = null;
+globalThis.fetch = async (url, opts = {}) => {
+  const u = String(url);
+  const auth = opts.headers?.Authorization || "";
+  if (u.includes("/auth/v1/token")) {
+    heal.authCalls++; heal.order.push("auth");
+    if (heal.refreshFails) return mockRes(400, { message: "Invalid Refresh Token" });
+    return mockRes(200, { access_token: heal.newToken, refresh_token: "refresh-new",
+      expires_in: 3600, user: { id: heal.newUserId, email: "owner@x.com" } });
+  }
+  heal.order.push("rest");
+  heal.restAuth.push(auth);
+  if (heal.all401) return mockRes(401, { message: "JWT expired" });
+  if (auth === `Bearer ${heal.oldToken}`) return mockRes(401, { message: "JWT expired" });
+  if (auth === `Bearer ${heal.newToken}` && heal.newTokenAlso401) return mockRes(401, { message: "JWT expired" });
+  if (u.includes("module_installs")) return mockRes(200, [{ module_slug: "team-board" }]);
+  if (u.includes("modules")) return mockRes(200, [{ slug: "team-board" }]);
+  return mockRes(200, []);
+};
+const freshHeal = (over = {}) => ({
+  authCalls: 0, restAuth: [], order: [], refreshFails: false,
+  oldToken: "old-token", newToken: "new-token", newUserId: "user-new",
+  newTokenAlso401: false, all401: false, ...over
+});
+function healAdapter(session) {
+  globalThis.localStorage = healStorage(session);
+  return new SupabaseAdapter(sbCfg);
+}
+// (a) expired session: 401 -> one refresh -> retry with the NEW token.
+heal = freshHeal();
+const adA = healAdapter(expiredSess("old-token", "refresh-ok", "user-old"));
+const rowsA = await adA._get("modules?select=*");
+check("self-heal (a): a 401 on an expired session heals and returns data",
+  Array.isArray(rowsA) && rowsA[0]?.slug === "team-board");
+check("self-heal (a): exactly one refresh, and the retry carries the NEW access token",
+  heal.authCalls === 1 && heal.restAuth.join(" | ") === "Bearer old-token | Bearer new-token",
+  heal.restAuth.join(" | "));
+// (f) identity sync after a successful recovery.
+check("self-heal (f): after recovery the session + identity are the fresh session's",
+  adA.session?.access_token === "new-token" && adA.userId === "user-new", `userId=${adA.userId}`);
+// (b) revoked refresh: session cleared, single retry with the ANON key.
+heal = freshHeal({ refreshFails: true });
+const adB = healAdapter(expiredSess("old-token", "refresh-revoked", "user-old"));
+const rowsB = await adB._get("modules?select=*");
+check("self-heal (b): a revoked refresh clears the session and the retry uses the ANON key",
+  Array.isArray(rowsB) && rowsB[0]?.slug === "team-board" && adB.session === null &&
+  heal.restAuth.length === 2 && heal.restAuth[1] === ANON_AUTH, heal.restAuth.join(" | "));
+check("self-heal (b/f): after a clear the identity falls back to the anon id, one refresh attempted",
+  adB.userId === adB.anonId && heal.authCalls === 1, `userId=${adB.userId}`);
+// (c) anon 401: no session -> no recovery attempt, throws as before.
+heal = freshHeal({ all401: true });
+const adC = healAdapter(null);
+let errC = null;
+try { await adC._get("modules?select=*"); } catch (e) { errC = e; }
+check("self-heal (c): an anon 401 throws with NO refresh attempted",
+  !!errC && /401/.test(errC.message) && heal.authCalls === 0 && heal.restAuth.length === 1,
+  `authCalls=${heal.authCalls} rests=${heal.restAuth.length}`);
+// (d) double 401: retry also rejected -> throws, bounded at 2 requests + 1 refresh.
+heal = freshHeal({ newTokenAlso401: true });
+const adD = healAdapter(expiredSess("old-token", "refresh-ok", "user-old"));
+let errD = null;
+try { await adD._get("modules?select=*"); } catch (e) { errD = e; }
+check("self-heal (d): a second 401 throws — exactly 2 requests + 1 refresh, never a loop",
+  !!errD && /401/.test(errD.message) && heal.restAuth.length === 2 && heal.authCalls === 1,
+  `rests=${heal.restAuth.length} authCalls=${heal.authCalls}`);
+// (e) proactive: getCoreState refreshes BEFORE the first data request.
+heal = freshHeal();
+const adE = healAdapter(expiredSess("old-token", "refresh-ok", "user-old"));
+const coreE = await adE.getCoreState();
+check("self-heal (e): getCoreState refreshes before fetching — first request already carries the new token, zero 401s",
+  heal.authCalls === 1 && heal.order[0] === "auth" && heal.restAuth.length === 3 &&
+  heal.restAuth.every((a) => a === "Bearer new-token") && coreE.installs.join() === "team-board",
+  `order=${heal.order.join(",")} rests=${heal.restAuth.join(" | ")}`);
+// (h) re-entrancy: concurrent boot fetches share the one in-flight sync.
+heal = freshHeal();
+const adH = healAdapter(expiredSess("old-token", "refresh-ok", "user-old"));
+await Promise.all([adH.getCoreState(), adH.getCoreState()]);
+check("self-heal (h): concurrent boot fetches share one session sync (no duplicate refresh)",
+  heal.authCalls === 1, `authCalls=${heal.authCalls}`);
+// (g) validSession itself throws: treated as cleared, retry on anon key.
+heal = freshHeal();
+const adG = healAdapter(expiredSess("old-token", "refresh-ok", "user-old"));
+let stubCalls = 0;
+adG.auth.validSession = async () => { stubCalls++; throw new Error("refresh exploded"); };
+const rowsG = await adG._get("modules?select=*");
+check("self-heal (g): if validSession throws, the session is treated as cleared and the retry uses the ANON key",
+  Array.isArray(rowsG) && rowsG[0]?.slug === "team-board" && stubCalls === 1 && adG.session === null &&
+  heal.restAuth.length === 2 && heal.restAuth[1] === ANON_AUTH && adG.userId === adG.anonId,
+  heal.restAuth.join(" | "));
+globalThis.fetch = realFetchBackup;
+delete globalThis.localStorage;
+
 // ------------------------------------------------------------ source statics
 const dataJs = readFileSync(join(root, "public/lib/data.mjs"), "utf8");
 check("data layer beats presence via presence_beats upsert only",
@@ -718,7 +836,12 @@ check("data layer beats presence via presence_beats upsert only",
 check("realtime source sends phoenix heartbeat frames", dataJs.includes('topic: "phoenix", event: "heartbeat"'));
 check("realtime source reconnects on the capped backoff ladder",
   dataJs.includes("[1000, 2000, 5000, 10000, 30000]") && dataJs.includes("scheduleReconnect"));
-check("config version is 1.0.4", readFileSync(join(root, "public/config.js"), "utf8").includes('version: "1.0.4"'));
+check("data layer heals a 401 via a shared session sync + exactly one retry",
+  dataJs.includes("_syncSessionFromAuth") && dataJs.includes("res.status === 401") && dataJs.includes("_authRetried"));
+check("boot/refresh entry points proactively refresh an expired session (shared expiry helper, not a copy)",
+  dataJs.includes("_ensureFreshSession") && dataJs.includes("isSessionExpired(this.session)") &&
+  dataJs.includes('from "./auth.mjs"') && dataJs.includes("isSessionExpired,"));
+check("config version is 1.0.5", readFileSync(join(root, "public/config.js"), "utf8").includes('version: "1.0.5"'));
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);
